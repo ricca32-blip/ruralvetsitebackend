@@ -1,93 +1,69 @@
-# Rural Vet AI PRO backend
+# Rural Vet AI backend v5
 
-Questo backend v3 e' il ponte tra il gestionale Rural Vet e OpenAI.
-La chiave OpenAI resta qui, non dentro `Index.html`.
+Backend PRO per collegare Rural Vet AI a OpenAI e al gestionale.
 
-## Cosa fa
+## Novita v5
 
-- riceve messaggi, foto e contesto dal gestionale;
-- legge aziende, prestazioni, appunti e memoria recente inviati dal frontend;
-- chiama OpenAI;
-- risponde in stile breve e interattivo;
-- prepara azioni operative, per esempio inserire interventi;
-- restituisce eventuali nuove informazioni da salvare nella memoria AI del gestionale.
+- Risposte gestionali piu sicure: per dashboard, P.IVA, CF, SDI, indirizzi, ricavi, fatture, interventi, listino e km il backend usa prima i dati reali ricevuti dal gestionale.
+- Se un dato non e presente nel contesto, non lo inventa.
+- Risposte piu rapide per domande contabili/anagrafiche: molte vengono calcolate direttamente dal backend senza chiamare OpenAI.
+- OpenAI resta usato per linguaggio naturale, casi ambigui, clinica, immagini e comandi operativi complessi.
+- Migliorata la gestione delle casistiche da assistente operativo: inserimento interventi, eliminazione interventi, creazione clienti, domande su fatturato, pagamenti, km, listino, clienti e dashboard.
+- Validazione delle azioni: se OpenAI restituisce un id cliente/prestazione/intervento non presente nel contesto, il backend lo svuota per evitare salvataggi errati.
 
-## Dove si salva la conoscenza?
-
-Per questa versione la conoscenza si salva nel cloud che usi gia': JSONbin.
-Nel backup del gestionale vengono aggiunti questi campi:
-
-- `db.cfg.ai`: endpoint backend, stile di risposta, appunti e protocolli scritti da te;
-- `db.cfg.aiMemory`: memoria appresa durante l'uso, correzioni, preferenze e interventi salvati;
-- `db.int`: interventi creati o confermati dal chatbot.
-
-OpenAI non e' il tuo database. OpenAI riceve il contesto a ogni richiesta e risponde.
-La memoria stabile resta nel tuo gestionale/cloud.
-
-
-## Novita v3
-
-- supporto alla creazione clienti/aziende da Rural Vet AI;
-- catalogo aziende arricchito con ragione sociale, indirizzo, comune, CAP, provincia, P.IVA, CF e SDI;
-- se un intervento cita un cliente non presente, il backend lascia companyId vuoto e il gestionale propone la creazione del nuovo cliente;
-- migliorato il comportamento agente: interventi e nuovi clienti passano sempre da conferma prima del salvataggio.
-
-## Avvio locale
-
-```bash
-npm install
-cp .env.example .env
-# apri .env e inserisci OPENAI_API_KEY
-npm start
-```
-
-Endpoint locale da inserire nel gestionale:
+## Variabili ambiente Render
 
 ```txt
-http://localhost:3000/api/vet-ai-chat
+OPENAI_API_KEY=la_tua_chiave
+OPENAI_MODEL=gpt-4o-mini
+ALLOWED_ORIGIN=*
 ```
 
-## Deploy consigliato su Render
-
-1. Crea un nuovo repository GitHub con questa cartella.
-2. Vai su Render e crea un nuovo Web Service.
-3. Build command: `npm install`.
-4. Start command: `npm start`.
-5. Health check path: `/api/health`.
-6. Environment variables:
-   - `OPENAI_API_KEY`: la tua chiave OpenAI;
-   - `OPENAI_MODEL`: `gpt-4o-mini` per iniziare;
-   - `ALLOWED_ORIGIN`: `*` in test, poi il dominio del gestionale.
-7. Copia l'URL pubblico del servizio, per esempio:
+Facoltative:
 
 ```txt
-https://rural-vet-ai-backend.onrender.com/api/vet-ai-chat
+OPENAI_TIMEOUT_MS=24000
+MAX_INPUT_CHARS=7000
 ```
 
-8. Apri Rural Vet AI > Appunti > Endpoint backend AI e incolla l'URL.
+## Endpoint
 
-## Comandi supportati
-
-Esempi:
+Health:
 
 ```txt
-Ho fatto un cesareo da Arata e due fecondazioni
+/api/health
 ```
 
-Il backend prepara l'azione. Il gestionale chiede conferma. Scrivendo:
+Chat:
 
 ```txt
-SALVA
+/api/vet-ai-chat
 ```
 
-il frontend registra l'intervento nel gestionale e salva la memoria nel cloud.
+## Strategia anti-stupidate
+
+Per le domande tipo:
+
+- qual e la P.IVA di Gramigna?
+- quanto ha fatturato Medardo da inizio anno?
+- quanti interventi ho fatto oggi?
+- quanto e da pagare?
+- dammi la giornata di Edoardo
+- quanti km ha fatto Medardo?
+
+il backend calcola direttamente dai dati del gestionale quando il frontend li invia nel payload.
+OpenAI non deve inventare numeri.
+
+## Aggiornamento su GitHub/Render
+
+1. Decomprimi questo zip.
+2. Sostituisci nel repository GitHub del backend tutti i file.
+3. Commit su `main`.
+4. Render fara il redeploy automatico.
+5. Testa:
 
 ```txt
-Ricorda: nelle metriti post parto voglio sempre che mi chieda odore dello scolo, temperatura e BHBA.
+https://rural-vet-ai.onrender.com/api/health
 ```
 
-La memoria viene salvata nel JSONbin del gestionale.
-
-## Nota privacy
-
-Il backend invia a OpenAI il messaggio dell'utente, gli appunti rilevanti, la memoria recente e il catalogo necessario per capire aziende/prestazioni. Non mettere dati non necessari negli appunti.
+Deve indicare `version: 5.0.0`.
