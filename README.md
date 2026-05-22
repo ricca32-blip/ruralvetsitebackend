@@ -1,6 +1,6 @@
 # Rural Vet AI PRO backend
 
-Questo backend e' il ponte tra il gestionale Rural Vet e OpenAI.
+Questo backend v3 e' il ponte tra il gestionale Rural Vet e OpenAI.
 La chiave OpenAI resta qui, non dentro `Index.html`.
 
 ## Cosa fa
@@ -23,6 +23,14 @@ Nel backup del gestionale vengono aggiunti questi campi:
 
 OpenAI non e' il tuo database. OpenAI riceve il contesto a ogni richiesta e risponde.
 La memoria stabile resta nel tuo gestionale/cloud.
+
+
+## Novita v3
+
+- supporto alla creazione clienti/aziende da Rural Vet AI;
+- catalogo aziende arricchito con ragione sociale, indirizzo, comune, CAP, provincia, P.IVA, CF e SDI;
+- se un intervento cita un cliente non presente, il backend lascia companyId vuoto e il gestionale propone la creazione del nuovo cliente;
+- migliorato il comportamento agente: interventi e nuovi clienti passano sempre da conferma prima del salvataggio.
 
 ## Avvio locale
 

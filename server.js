@@ -7,7 +7,7 @@ import OpenAI from 'openai';
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 8000);
+const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 4500);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 if (!process.env.OPENAI_API_KEY) {
@@ -30,13 +30,24 @@ function asArray(value) {
 
 function compactCatalog(context = {}) {
   const aziende = asArray(context.aziende)
-    .slice(0, 1200)
-    .map(a => ({ id: a.id, nome: safeText(a.nome, 120), addr: safeText(a.addr, 180) }))
-    .filter(a => a.nome);
+    .slice(0, 800)
+    .map(a => ({
+      id: a.id,
+      nome: safeText(a.nome, 140),
+      ragioneSociale: safeText(a.ragioneSociale, 180),
+      addr: safeText(a.addr || a.indirizzo, 220),
+      comune: safeText(a.comune, 100),
+      cap: safeText(a.cap, 20),
+      provincia: safeText(a.provincia, 20),
+      piva: safeText(a.piva, 40),
+      cf: safeText(a.cf, 40),
+      sdi: safeText(a.sdi, 40)
+    }))
+    .filter(a => a.nome || a.ragioneSociale);
 
   const prestazioni = asArray(context.prestazioni)
-    .slice(0, 1500)
-    .map(p => ({ id: p.id, nome: safeText(p.nome, 160), cat: safeText(p.cat, 80), tipo: safeText(p.tipo, 80), price: p.price }))
+    .slice(0, 700)
+    .map(p => ({ id: p.id, nome: safeText(p.nome, 160), cat: safeText(p.cat, 80), tipo: safeText(p.tipo, 80) }))
     .filter(p => p.nome);
 
   return { aziende, prestazioni };
@@ -44,7 +55,7 @@ function compactCatalog(context = {}) {
 
 function recentMemory(context = {}) {
   return asArray(context.aiMemoryRecent)
-    .slice(0, 80)
+    .slice(0, 35)
     .map(m => ({
       at: m.at,
       userName: safeText(m.userName, 80),
@@ -56,24 +67,26 @@ function recentMemory(context = {}) {
 
 function buildSystemPrompt() {
   return `
-Sei Rural Vet AI, agente AI operativo dentro un gestionale veterinario buiatrico.
+Sei Rural Vet AI, agente operativo dentro un gestionale veterinario buiatrico.
 Rispondi SEMPRE in italiano.
 Stile: come ChatGPT, naturale, concreto, breve.
 
+COMPORTAMENTO COME ASSISTENTE DEL PROFILO
+- L'utente corrente e' il veterinario/operatore che ha fatto l'accesso.
+- Se chiede di registrare interventi, comportati come assistente operativo: estrai azienda, prestazioni, quantita, data, ora/sessione e nota.
+- Usa prestazioni presenti nel catalogo ricevuto.
+- Per le aziende: se trovi corrispondenza sicura nel catalogo, usa companyId. Cerca anche in ragione sociale, indirizzo, comune, P.IVA, CF e SDI.
+- Se l'azienda NON e' nel catalogo, non inventare un id: lascia companyId vuoto e usa companyName scritto dall'utente. Il gestionale proporra' di creare il nuovo cliente.
+- Se l'utente chiede di aggiungere un cliente/azienda, restituisci action type "create_client".
+- Se data o ora mancano per un intervento, NON inventarle: chiedi se registrare ADESSO oppure in altro giorno/ora.
+- Non dire mai "fatto" prima che il gestionale abbia salvato.
+- Prepara riepilogo e chiedi conferma con "Scrivi SALVA".
+- Se ci sono piu' interventi in una giornata, puoi restituire piu' azioni.
+
 COMPORTAMENTO CLINICO
-- Se e' un caso clinico: dai la diagnosi piu probabile quando i dati lo permettono.
-- Poi massimo 2 diagnosi differenziali.
-- Poi massimo 2-3 domande mirate per stringere il caso.
+- Se e' un caso clinico: diagnosi piu' probabile quando possibile, massimo 2 differenziali e massimo 3 domande mirate.
 - Evita spiegoni lunghi.
 - Non inventare dati, dosaggi, ricette o tempi di sospensione se non sono negli appunti/protocolli forniti.
-- Ricorda che il veterinario responsabile conferma sempre diagnosi e terapia.
-
-COMANDI GESTIONALE
-- Se l'utente vuole registrare interventi, devi estrarre azienda, prestazioni, quantita, data, ora/sessione e nota.
-- Usa SOLO aziende e prestazioni presenti nel catalogo ricevuto.
-- Se azienda o prestazione non sono riconoscibili, fai una sola domanda secca.
-- Non dire mai "fatto" prima che il frontend abbia salvato.
-- Prepara riepilogo e chiedi conferma con "Scrivi SALVA".
 
 APPRENDIMENTO
 - La memoria vera viene salvata dal gestionale nel cloud Rural Vet/JSONbin.
@@ -85,16 +98,31 @@ FORMATO OBBLIGATORIO
 Rispondi SOLO con JSON valido, senza markdown, senza testo fuori JSON:
 {
   "reply": "testo breve per l'utente",
-  "action": null oppure {
+  "action": null oppure una di queste azioni:
+  {
     "type": "create_intervention",
     "companyName": "nome azienda",
-    "companyId": "id se sicuro",
+    "companyId": "id se sicuro, vuoto se azienda nuova",
     "services": [{"name":"nome prestazione", "id":"id se sicuro", "qty":1}],
     "date": "YYYY-MM-DD oppure vuoto",
     "time": "HH:MM oppure vuoto",
     "session": "m oppure p oppure n oppure vuoto",
     "note": "nota breve"
+  }
+  oppure
+  {
+    "type": "create_client",
+    "name": "nome gestionale cliente",
+    "ragioneSociale": "ragione sociale per fattura",
+    "address": "indirizzo completo",
+    "comune": "comune",
+    "cap": "CAP",
+    "provincia": "provincia",
+    "piva": "partita IVA",
+    "cf": "codice fiscale",
+    "sdi": "codice SDI"
   },
+  "actions": [] oppure lista di azioni create_intervention/create_client se ci sono piu' operazioni,
   "learn": []
 }
 `;
@@ -112,7 +140,7 @@ function buildUserPayload(reqBody) {
     catalogo_aziende: catalog.aziende,
     catalogo_prestazioni: catalog.prestazioni,
     memoria_recente_cloud: memory,
-    istruzioni_e_appunti_frontend: safeText(reqBody.system, 18000),
+    istruzioni_e_appunti_frontend: safeText(reqBody.system, 10000),
     impostazioni_ai: reqBody.settings || {},
     contatori_gestionale: context.counts || {},
     foto_allegata: reqBody.image ? { name: reqBody.image.name, mime: reqBody.image.mime } : null
@@ -161,7 +189,7 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     const payload = buildUserPayload(body);
 
     const history = asArray(body.conversation)
-      .slice(-10)
+      .slice(-5)
       .map(m => ({
         role: m.role === 'user' ? 'user' : 'assistant',
         content: safeText(m.content || m.text, 1500)
@@ -187,6 +215,7 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     res.json({
       reply: safeText(parsed.reply || 'Dimmi meglio cosa vuoi fare.', 3000),
       action: parsed.action || null,
+      actions: Array.isArray(parsed.actions) ? parsed.actions.slice(0, 10) : [],
       learn: Array.isArray(parsed.learn) ? parsed.learn.slice(0, 8) : [],
       usage: completion.usage || null,
       model: MODEL
@@ -203,5 +232,5 @@ app.post('/api/vet-ai-chat', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Rural Vet AI backend attivo sulla porta ${PORT} con modello ${MODEL}`);
+  console.log(`Rural Vet AI backend v3 attivo sulla porta ${PORT} con modello ${MODEL}`);
 });
