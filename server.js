@@ -519,7 +519,17 @@ function formatInvoice(f) {
 }
 
 async function openAIJson(messages, maxTimeout = OPENAI_TIMEOUT_MS) {
-  const completionPromise = openai.chat.completions.create({ model: MODEL, temperature: 0.05, response_format: { type: 'json_object' }, messages });
+  // OpenAI richiede che, quando si usa response_format json_object,
+  // almeno un messaggio contenga esplicitamente la parola "json".
+  const hasJsonWord = messages.some(m => {
+    const c = Array.isArray(m.content) ? m.content.map(x => x.text || '').join(' ') : String(m.content || '');
+    return /json/i.test(c);
+  });
+  const safeMessages = hasJsonWord
+    ? messages
+    : [{ role: 'system', content: 'Rispondi sempre e solo in JSON valido.' }, ...messages];
+
+  const completionPromise = openai.chat.completions.create({ model: MODEL, temperature: 0.05, response_format: { type: 'json_object' }, messages: safeMessages });
   const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout OpenAI')), maxTimeout));
   const completion = await Promise.race([completionPromise, timeoutPromise]);
   const raw = completion.choices?.[0]?.message?.content || '{}';
@@ -740,7 +750,7 @@ function executePlan(plan, text, ctx) {
 
 function buildGeneralPrompt() {
   return `Sei Rural Vet AI dentro un gestionale veterinario buiatrico.
-Rispondi in italiano, breve e operativo.
+Rispondi in italiano, breve e operativo. Restituisci sempre JSON valido con almeno il campo reply.
 Non inventare dati del gestionale: se chiede numeri, clienti, fatture, P.IVA, interventi o km e non li hai nei dati, dillo.
 Per clinica buiatrica: diagnosi probabile se possibile, massimo 2 differenziali, massimo 3 domande mirate. Non fare spiegoni.`;
 }
