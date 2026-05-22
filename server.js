@@ -17,6 +17,11 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' 
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '60mb' }));
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN.split(',').map(s => s.trim()) }));
+app.options('*', cors());
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 function safeText(value, max = 5000) {
   return String(value ?? '').replace(/\u0000/g, '').slice(0, max);
@@ -754,6 +759,17 @@ function toOpenAIContent(payload, image) {
   if (!image || !image.dataUrl) return JSON.stringify(payload);
   return [ { type: 'text', text: JSON.stringify(payload) }, { type: 'image_url', image_url: { url: image.dataUrl } } ];
 }
+async function safeGeneralAnswer(body, ctx) {
+  if (!process.env.OPENAI_API_KEY) {
+    return { reply: 'Backend attivo, ma manca OPENAI_API_KEY su Render.', action: null, actions: [], learn: [], source: 'missing-key' };
+  }
+  try {
+    return await generalAnswer(body, ctx);
+  } catch (err) {
+    console.error('OpenAI generalAnswer non riuscita:', err);
+    return { reply: 'Il backend è raggiungibile, ma OpenAI non ha risposto correttamente. Controlla OPENAI_API_KEY, OPENAI_MODEL e quota/limiti API su Render.', action: null, actions: [], learn: [], source: 'openai-error', error: err.message };
+  }
+}
 async function generalAnswer(body, ctx) {
   const history = asArray(body.conversation).slice(-4).map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: safeText(m.content || m.text, 1200) })).filter(m => m.content);
   const messages = [
@@ -814,8 +830,7 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     }
 
     if (!result) {
-      if (!process.env.OPENAI_API_KEY) return res.status(500).json({ reply: 'Backend attivo, ma manca OPENAI_API_KEY su Render.', action: null, actions: [], learn: [], source: 'missing-key' });
-      result = await generalAnswer(body, ctx);
+      result = await safeGeneralAnswer(body, ctx);
       source = result.source || 'openai-general';
     }
 
@@ -823,8 +838,13 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 4000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v6', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
-    res.status(500).json({ reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v6' });
+    res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v6' });
   }
+});
+
+app.post(['/api/ai', '/api/chat'], (req, res, next) => {
+  req.url = '/api/vet-ai-chat';
+  app._router.handle(req, res, next);
 });
 
 app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
