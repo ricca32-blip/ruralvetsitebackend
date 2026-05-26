@@ -10,7 +10,7 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 9000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 24000);
-const VERSION = '6.0.0';
+const VERSION = '8.0.0';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' });
 
@@ -454,11 +454,11 @@ function requestedFields(text) {
 }
 function looksManagement(text) {
   const n = norm(text);
-  return /\b(piva|partita iva|codice fiscale|\bcf\b|sdi|indirizzo|ragione sociale|cliente|clienti|azienda|aziende|fatturato|fatture|fattura|ricavi|ricavo|incassato|pagato|pagata|da pagare|da fatturare|intervento|interventi|prestazione|prestazioni|giornata|dashboard|km|chilometri|rimborso|listino|prezzo|quanto|quanti|quale|mostra|dammi|cerca|elenca|telefono|email|mail|costo)\b/.test(n) || looksAction(text);
+  return /\b(piva|partita iva|codice fiscale|\bcf\b|sdi|indirizzo|ragione sociale|cliente|clienti|azienda|aziende|fatturato|fatture|fattura|ricavi|ricavo|incassato|incassi|pagato|pagata|da pagare|da fatturare|intervento|interventi|prestazione|prestazioni|giornata|dashboard|km|chilometri|rimborso|listino|prezzo|quanto|quanti|quale|mostra|dammi|cerca|elenca|telefono|email|mail|costo|media|top|classifica|trend|confronta|confronto|iva|imponibile|scadenza|scadute|scaduti|configurazione|impostazioni|collaboratore|utente|tariffa)\b/.test(n) || looksAction(text);
 }
 function looksAction(text) {
   const n = norm(text);
-  return /\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|salva|elimina|cancella|rimuovi|togli|annulla|crea cliente|nuovo cliente|aggiungi cliente)\b/.test(n);
+  return /\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|salva|elimina|cancella|rimuovi|togli|annulla|modifica|cambia|aggiorna|sposta|correggi|imposta|porta|crea cliente|nuovo cliente|aggiungi cliente|crea prestazione|nuova prestazione|emetti fattura|genera fattura|segna pagata|segna fatturato)\b/.test(n);
 }
 function isDeleteRequest(text) { return /\b(elimina|cancella|rimuovi|togli|annulla)\b/.test(norm(text)) && /\b(intervento|prestazione|cesareo|fecondazione|visita|ecografia|mastite|metrite|fattura)?/.test(norm(text)); }
 function isCreateClientRequest(text) { return /\b(crea|aggiungi|nuovo|inserisci)\b.*\b(cliente|azienda)\b/.test(norm(text)); }
@@ -516,6 +516,350 @@ function formatIntervention(i) {
 }
 function formatInvoice(f) {
   return `${f.data || '?'} · n.${f.numero || f.id || '?'} · ${f.azienda || '?'} · ${euro(f.tot)} · ${f.pagata ? 'pagata' : 'da pagare'}`;
+}
+
+
+function isHelpRequest(text) {
+  const n = norm(text);
+  return /\b(cosa puoi fare|aiuto|help|comandi|funzioni|come posso|cosa sai fare|manuale ai)\b/.test(n);
+}
+function pct(part, total) { return total ? `${((num(part) / num(total)) * 100).toFixed(1).replace('.', ',')}%` : '0%'; }
+function avg(total, count) { return count ? num(total) / count : 0; }
+function firstMoney(text) {
+  const raw = safeText(text, 2000);
+  let m = raw.match(/(?:€|eur|euro)?\s*(\d{1,5}(?:[.,]\d{1,2})?)\s*(?:€|eur|euro)?/i);
+  return m ? num(m[1], NaN) : NaN;
+}
+function textAfter(text, rx) {
+  const m = safeText(text, 4000).match(rx);
+  return m ? safeText(m[1], 600).trim() : '';
+}
+function actionButtons(kind = 'save') {
+  if (kind === 'delete') return ['ELIMINA', 'Annulla'];
+  if (kind === 'when') return ['ADESSO', 'oggi 14:30', 'ieri 09:00', 'Annulla'];
+  if (kind === 'choice') return [];
+  return ['SALVA', 'Annulla'];
+}
+function response(reply, action = null, quickReplies = []) {
+  return { reply, action, actions: [], learn: [], quickReplies };
+}
+function groupMap(items, keyFn, valueFn) {
+  const map = new Map();
+  for (const item of items) {
+    const key = keyFn(item) || 'Non indicato';
+    const value = valueFn ? num(valueFn(item), 0) : num(item.tot, 0);
+    const old = map.get(key) || { key, count: 0, total: 0, items: [] };
+    old.count += 1; old.total += value; old.items.push(item);
+    map.set(key, old);
+  }
+  return [...map.values()].sort((a, b) => b.total - a.total || b.count - a.count || String(a.key).localeCompare(String(b.key), 'it'));
+}
+function serviceTotalRows(items) {
+  const map = new Map();
+  for (const i of items) {
+    for (const p of i.prestazioni || []) {
+      const key = p.nome || String(p.id || 'Prestazione');
+      const old = map.get(key) || { key, count: 0, qty: 0, total: 0 };
+      old.count += 1; old.qty += num(p.qty, 1); old.total += num(p.total, num(p.price) * num(p.qty, 1));
+      map.set(key, old);
+    }
+  }
+  return [...map.values()].sort((a,b)=>b.total-a.total || b.qty-a.qty || String(a.key).localeCompare(String(b.key),'it'));
+}
+function monthKey(dateString) { return String(dateString || '').slice(0, 7) || 'Senza data'; }
+function dayKey(dateString) { return String(dateString || '').slice(0, 10) || 'Senza data'; }
+function hasAny(n, words) { return words.some(w => n.includes(w)); }
+function detectRequestedServices(text, services, { max = 8 } = {}) {
+  const raw = safeText(text, 4000);
+  const n = canonicalServiceText(raw);
+  const out = [];
+  const add = (svc, qty = 1, score = 0) => {
+    if (!svc) return;
+    const key = String(svc.id || norm(svc.nome));
+    const old = out.find(x => String(x.id || norm(x.nome)) === key);
+    if (old) { old.qty = Math.max(old.qty || 1, qty || 1); old.score = Math.max(old.score || 0, score || 0); return; }
+    out.push({ id: svc.id, nome: svc.nome, name: svc.nome, qty: Math.max(1, qty || 1), score });
+  };
+  const syns = [
+    [/cesar|taglio cesareo/, /cesar/],
+    [/fecond|insemin/, /fecond|insemin/],
+    [/ecograf/, /ecograf/],
+    [/mastit/, /mastit/],
+    [/metrit/, /metrit/],
+    [/vaccin/, /vaccin/],
+    [/visita\s+clin/, /visita.*clin/],
+    [/visita\s+riprod|ginecol|gravidanza/, /riprod|gravid|ginecol/],
+    [/post\s*parto|puerper/, /post.*parto|puerper/],
+    [/disloc|abomas/, /disloc|abomas/],
+    [/terapia\s+endoven|endovena/, /terapia.*endoven|endoven/],
+    [/preliev|sangue|feci/, /preliev|sangue|feci/],
+    [/calcio|ipocalc/, /calcio/],
+    [/emogas/, /emogas/],
+    [/autops/, /autops/]
+  ];
+  for (const [rx, svcRx] of syns) {
+    const m = n.match(rx);
+    if (m) add(services.find(s => svcRx.test(canonicalServiceText(s.nome))), qtyNearService(raw, m[0]), 100);
+  }
+  const parts = raw.split(/[,;+]|\s+(?:e|piu|più|con)\s+/i).map(x=>x.trim()).filter(x=>x.length>2);
+  for (const part of parts) {
+    const res = resolveServices(part, services);
+    if (!res.ambiguous && res.matches.length) add(res.matches[0], qtyNearService(raw, res.matches[0].nome), 75);
+  }
+  for (const svc of services) {
+    const st = canonicalServiceText(svc.nome);
+    if (!st || st.length < 5) continue;
+    const score = tokenScore(n, st, { strong: true });
+    const svcTokens = meaningfulTokens(st).filter(t => t.length > 3);
+    const hits = svcTokens.filter(t => n.includes(t)).length;
+    if ((score >= 86 && hits >= 1) || hits >= Math.min(2, svcTokens.length)) add(svc, qtyNearService(raw, svc.nome), score);
+  }
+  return out.sort((a,b)=>b.score-a.score || String(a.nome).localeCompare(String(b.nome),'it')).slice(0, max).map(({score, ...x})=>x);
+}
+function extractServiceFilter(text, ctx) {
+  const direct = serviceTextFromRequest(text);
+  if (direct) return direct;
+  const candidates = detectRequestedServices(text, ctx.services, { max: 1 });
+  return candidates[0]?.nome || '';
+}
+function managementHelpQuery(text, ctx) {
+  if (!isHelpRequest(text)) return null;
+  return response(`Posso controllare quasi tutto il gestionale da chat:\n• interventi: inserire, cercare, contare, modificare data/ora/cliente/prestazioni/note/fatturato, eliminare;\n• aziende: cercare dati fiscali, creare, modificare P.IVA/CF/SDI/indirizzo/tel/km, eliminare;\n• listino: cercare prezzi, creare voci, cambiare prezzi base o prezzi specifici per azienda;\n• fatture: elencare, emettere per cliente, segnare pagate/non pagate, annullare;\n• analisi: ricavi per giorno/mese/anno/YTD, da fatturare, incassato, fatture aperte/scadute, top clienti, top prestazioni, ricavi per veterinario, medie e confronti;\n• impostazioni: IVA, tariffe km, casa/email/tel dei collaboratori.\nPer ogni modifica preparo l'azione e ti chiedo SALVA o ELIMINA prima di toccare i dati.`, null, ['Inserisci intervento', 'Ricavi da inizio anno', 'Top clienti mese', 'Aiutami con un caso clinico']);
+}
+function periodForPrevious(period) {
+  if (!period?.from || !period?.to) return null;
+  const from = dateFromISO(period.from), to = dateFromISO(period.to);
+  if (!from || !to) return null;
+  const days = Math.round((to - from) / 86400000) + 1;
+  const prevTo = addDays(from, -1);
+  const prevFrom = addDays(prevTo, -days + 1);
+  return { from: isoDate(prevFrom), to: isoDate(prevTo), label: `periodo precedente (${isoDate(prevFrom)} - ${isoDate(prevTo)})` };
+}
+function analyticsQuery(text, ctx) {
+  const n = norm(text);
+  const wants = /\b(ricavi|ricavo|fatturato|fatturati|fatture|fattura|incassato|incassi|pagato|pagata|da pagare|da fatturare|economico|totale|top|classifica|miglior|peggior|media|medie|trend|per cliente|per azienda|per veterinario|per collaboratore|per prestazione|per mese|per giorno|scadut|aperte|imponibile|iva|ytd|inizio anno|anno|mese|settimana)\b/.test(n);
+  if (!wants) return null;
+  const filters = managementFilters(text, ctx, /\boggi\b|\bgiorno\b/.test(n) ? 'today' : 'ytd');
+  if (filters.companyResult.ambiguous) return response('Ho trovato più clienti possibili:\n' + filters.companyResult.alternatives.map((a,i)=>`${i+1}) ${a.nome}`).join('\n') + '\nQuale intendi?');
+  const ints = filterInterventions(ctx, filters);
+  const invs = filterInvoices(ctx, filters);
+  const invPaid = invs.filter(f => f.pagata);
+  const invUnpaid = invs.filter(f => !f.pagata);
+  const invoicedInts = ints.filter(i => i.fatt);
+  const notInvoicedInts = ints.filter(i => !i.fatt);
+  const scope = displayScope(filters) || periodLabel(filters.period);
+  const ricavi = interventionTotal(ints);
+  const fattureEmesse = invoiceTotal(invs);
+  const incassato = invoiceTotal(invPaid);
+  const aperte = invoiceTotal(invUnpaid);
+  const daFatturare = interventionTotal(notInvoicedInts);
+  const imponibile = invs.reduce((s,f)=>s+num(f.imponibile, 0),0);
+  const iva = invs.reduce((s,f)=>s+num(f.iva, 0),0);
+  const todayIso = isoDate(ctx.now);
+  const scadute = invUnpaid.filter(f => f.scadenza && f.scadenza < todayIso);
+
+  if (/\bscadut/.test(n)) {
+    if (!scadute.length) return response(`Non risultano fatture scadute per ${scope}.`);
+    return response(`Fatture scadute ${scope}: ${scadute.length}, totale ${euro(invoiceTotal(scadute))}.\n` + scadute.slice(0,15).map(f => `- ${formatInvoice(f)}${f.scadenza ? ' · scad. ' + f.scadenza : ''}`).join('\n'));
+  }
+  if (/\btop\b|\bclassifica\b|\bmiglior/.test(n) || /per\s+(cliente|azienda|veterinario|collaboratore|prestazione|mese|giorno)/.test(n)) {
+    let rows = [];
+    const byService = /per\s+prestaz|top\s+prestaz|classifica\s+prestaz|miglior[ie]?\s+prestaz/.test(n);
+    const byUser = /per\s+(veterinario|collaboratore|utente)|top\s+(veterinari|collaboratori|utenti)|classifica\s+(veterinari|collaboratori|utenti)/.test(n);
+    const byMonth = /per\s+mese|mese\s+per\s+mese|mensil/.test(n);
+    const byDay = /per\s+(giorno|giornata|data)|giorno\s+per\s+giorno|giornalier/.test(n);
+    if (byService) rows = serviceTotalRows(ints).map(r => ({ key: r.key, count: r.qty, total: r.total, detail: `${r.qty} q.tà · ${r.count} interventi` }));
+    else if (byUser) rows = groupMap(ints, i => i.userName || i.userId || 'Utente').map(r => ({...r, detail: `${r.count} interventi`}));
+    else if (byMonth) rows = groupMap(ints, i => monthKey(i.data)).map(r => ({...r, detail: `${r.count} interventi`}));
+    else if (byDay) rows = groupMap(ints, i => dayKey(i.data)).map(r => ({...r, detail: `${r.count} interventi`}));
+    else rows = groupMap(ints, i => i.azienda || 'Cliente').map(r => ({...r, detail: `${r.count} interventi`}));
+    if (!rows.length) return response(`Non ho dati per fare la classifica ${scope}.`);
+    return response(`Classifica ${scope}:\n` + rows.slice(0,12).map((r,i)=>`${i+1}) ${r.key}: ${euro(r.total)} · ${r.detail || (r.count + ' interventi')} · ${pct(r.total, ricavi)}`).join('\n'));
+  }
+  if (/\bmedia|medie|ticket medio|valore medio/.test(n)) {
+    const byDay = groupMap(ints, i => dayKey(i.data));
+    const activeDays = byDay.length;
+    return response(`Medie ${scope}:\nRicavo medio/intervento: ${euro(avg(ricavi, ints.length))}.\nInterventi medi/giorno attivo: ${activeDays ? (ints.length / activeDays).toFixed(1).replace('.', ',') : '0'}.\nRicavo medio/giorno attivo: ${euro(avg(ricavi, activeDays))}.\nFattura media emessa: ${euro(avg(fattureEmesse, invs.length))}.`);
+  }
+  if (/\bconfront|trend|vs\b|rispetto/.test(n)) {
+    const prev = periodForPrevious(filters.period);
+    const prevInts = prev ? filterInterventions(ctx, { ...filters, period: prev }) : [];
+    const prevTot = interventionTotal(prevInts);
+    const delta = ricavi - prevTot;
+    const sign = delta >= 0 ? '+' : '';
+    return response(`Confronto ${scope}:\nPeriodo attuale: ${euro(ricavi)} (${ints.length} interventi).\n${prev ? 'Periodo precedente: ' + euro(prevTot) + ' (' + prevInts.length + ' interventi).' : 'Periodo precedente non calcolabile.'}\nDifferenza: ${sign}${euro(delta)}${prevTot ? ' · ' + sign + pct(delta, prevTot) : ''}.`);
+  }
+  if (/\bda fatturare\b|\bnon fatturat/.test(n)) return response(`Da fatturare ${scope}: ${euro(daFatturare)} (${notInvoicedInts.length} interventi).`);
+  if (/\bda pagare\b|\bnon pagat|\baperte\b/.test(n)) return response(`Da pagare ${scope}: ${euro(aperte)} (${invUnpaid.length} fatture aperte).`);
+  if (/\bincass|\bpagat/.test(n) && !/fatturato/.test(n)) return response(`Incassato ${scope}: ${euro(incassato)} (${invPaid.length} fatture pagate).`);
+  if (/\bfatture\b|\bfattura\b/.test(n) && (/\bmostra\b|\belenca\b|\blista\b|\bdammi\b/.test(n))) {
+    if (!invs.length) return response(`Non trovo fatture per ${scope}.`);
+    return response(`Fatture ${scope}: ${invs.length}, totale ${euro(fattureEmesse)}.\n` + invs.slice(0, 15).map(f => `- ${formatInvoice(f)}`).join('\n') + (invs.length > 15 ? `\n+ altre ${invs.length - 15}` : ''));
+  }
+  return response(`Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(interventionTotal(invoicedInts))} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} (${invs.length}) · Imponibile: ${euro(imponibile)} · IVA: ${euro(iva)}.\nIncassato: ${euro(incassato)} · Da pagare: ${euro(aperte)}${scadute.length ? ' · Scadute: ' + euro(invoiceTotal(scadute)) : ''}.`, null, ['Top clienti', 'Da fatturare', 'Fatture aperte', 'Ricavi per prestazione']);
+}
+function parseClientFields(text) {
+  const raw = safeText(text, 4000);
+  const fields = {};
+  const set = (key, rx) => { const m = raw.match(rx); if (m && m[1]) fields[key] = safeText(m[1].replace(/[;,]+$/,'').trim(), 260); };
+  set('piva', /(?:p\.?iva|partita iva)\s*(?:e|è|=|:|a|in)?\s*([A-Z0-9]{8,16})/i);
+  set('cf', /(?:codice fiscale|\bcf\b)\s*(?:e|è|=|:|a|in)?\s*([A-Z0-9]{8,20})/i);
+  set('sdi', /(?:sdi|codice destinatario)\s*(?:e|è|=|:|a|in)?\s*([A-Z0-9]{6,8})/i);
+  set('tel', /(?:telefono|tel|cellulare)\s*(?:e|è|=|:|a|in)?\s*([^,;.]+)/i);
+  set('email', /(?:email|mail|pec)\s*(?:e|è|=|:|a|in)?\s*([^,;.\s]+@[^,;.\s]+)/i);
+  set('ragioneSociale', /(?:ragione sociale|rag sociale)\s*(?:e|è|=|:|a|in)?\s*([^;.]+)/i);
+  set('address', /(?:indirizzo|via|strada|localita|località|sede)\s*(?:e|è|=|:|a|in)?\s*([^;]+)/i);
+  set('comune', /(?:comune)\s*(?:e|è|=|:|a|in)?\s*([^,;.]+)/i);
+  set('cap', /\bcap\s*(?:e|è|=|:|a|in)?\s*(\d{5})/i);
+  set('provincia', /(?:provincia|prov\.)\s*(?:e|è|=|:|a|in)?\s*([A-Z]{2}|[^,;.]+)/i);
+  const km = raw.match(/(?:km|chilometri|distanza)\s*(?:e|è|=|:|a|in)?\s*(\d+(?:[.,]\d+)?)/i);
+  if (km) fields.km = num(km[1], 0);
+  const tailCode = raw.match(/\b(?:a|in|=|:)\s*([A-Z0-9]{6,20})\s*$/i);
+  if (tailCode) {
+    const code = safeText(tailCode[1], 24).toUpperCase();
+    if (!fields.piva && /\b(p\.?iva|partita iva)\b/i.test(raw) && /^\d{8,16}$/.test(code)) fields.piva = code;
+    if (!fields.cf && /\b(cf|codice fiscale)\b/i.test(raw) && /^[A-Z0-9]{8,20}$/.test(code)) fields.cf = code;
+    if (!fields.sdi && /\b(sdi|codice destinatario)\b/i.test(raw) && /^[A-Z0-9]{6,8}$/.test(code)) fields.sdi = code;
+  }
+  const addrTail = raw.match(/(?:indirizzo|sede|via|strada|localita|località).*?\b(?:a|in|=|:)\s+([^;]+)$/i);
+  if (addrTail) fields.address = safeText(addrTail[1].replace(/[;,]+$/,'').trim(), 260);
+  const telTail = raw.match(/(?:telefono|tel|cellulare).*?\b(?:a|in|=|:)\s+([+\d\s/.-]{5,30})\s*$/i);
+  if (telTail) fields.tel = safeText(telTail[1].trim(), 80);
+  return fields;
+}
+function companyMutationRequest(text, ctx) {
+  const n = norm(text);
+  if (isCreateClientRequest(text)) return null;
+  const isDelete = /\b(elimina|cancella|rimuovi|togli|archivia)\b/.test(n) && /\b(cliente|azienda)\b/.test(n);
+  const isUpdate = /\b(modifica|cambia|aggiorna|correggi|imposta|metti|porta)\b/.test(n) && /\b(cliente|azienda|piva|partita iva|codice fiscale|cf|sdi|indirizzo|telefono|email|mail|ragione sociale|km)\b/.test(n);
+  if (!isDelete && !isUpdate) return null;
+  const found = resolveCompany(text, ctx.companies, { allowWeak: true });
+  if (!found.match) {
+    if (found.alternatives.length) return response('Ho trovato più clienti possibili:\n' + found.alternatives.map((a,i)=>`${i+1}) ${a.nome}${a.comune ? ' · ' + a.comune : ''}`).join('\n') + '\nQuale intendi?');
+    return response('Non trovo il cliente da modificare nel gestionale. Dimmi il nome esatto come appare in Aziende.');
+  }
+  if (isDelete) return response(`Ho preparato l'eliminazione del cliente ${found.match.nome}. Scrivi ELIMINA per cancellarlo dal gestionale.`, { type:'delete_client', companyId: found.match.id, companyName: found.match.nome, query:text }, actionButtons('delete'));
+  const fields = parseClientFields(text);
+  if (!Object.keys(fields).length) return response(`Posso modificare ${found.match.nome}. Dimmi quale campo cambiare: P.IVA, CF, SDI, indirizzo, telefono, email, km o ragione sociale.`);
+  const lines = Object.entries(fields).map(([k,v])=>`${k}: ${v}`).join('\n');
+  return response(`Ho preparato la modifica cliente ${found.match.nome}:\n${lines}\nScrivi SALVA per aggiornare l'anagrafica.`, { type:'update_client', companyId: found.match.id, companyName: found.match.nome, fields, query:text }, actionButtons('save'));
+}
+function serviceMutationRequest(text, ctx) {
+  const n = norm(text);
+  const isCreate = /\b(crea|aggiungi|nuova|nuovo|inserisci)\b/.test(n) && /\b(prestazione|voce listino|farmaco|fiala|servizio)\b/.test(n);
+  const isDelete = /\b(elimina|cancella|rimuovi|togli)\b/.test(n) && /\b(prestazione|voce listino|listino|farmaco|fiala)\b/.test(n);
+  const amount = firstMoney(text);
+  const isUpdate = (/\b(modifica|cambia|aggiorna|correggi|imposta|metti|porta)\b/.test(n) && /\b(prezzo|listino|prestazione|farmaco|fiala)\b/.test(n)) || (/\bprezzo\b/.test(n) && Number.isFinite(amount) && /\b(a|=|euro|eur)\b/.test(n));
+  if (!isCreate && !isDelete && !isUpdate) return null;
+  if (isCreate) {
+    let name = textAfter(text, /(?:crea|aggiungi|nuova|nuovo|inserisci)\s+(?:prestazione|voce listino|farmaco|fiala|servizio)\s+(.+?)(?:\s+(?:prezzo|a|da)\s+\d|$)/i);
+    if (!name) name = textAfter(text, /(?:prestazione|voce listino|farmaco|fiala|servizio)\s+(.+?)(?:\s+(?:prezzo|a|da)\s+\d|$)/i);
+    if (!name) return response('Dimmi il nome della nuova voce listino e possibilmente il prezzo. Esempio: crea prestazione Controllo podale prezzo 45.');
+    const cat = textAfter(text, /categoria\s*[:=]?\s*([^,;.]+)/i) || 'Listino AI';
+    const tipo = /\bfarmaco\b/.test(n) ? 'Farmaco' : (/\bfiala\b/.test(n) ? 'Fiala' : 'Prestazione');
+    return response(`Ho preparato la nuova voce listino:\n${name}\nTipo: ${tipo} · Categoria: ${cat} · Prezzo: ${Number.isFinite(amount) ? euro(amount) : '0,00 €'}\nScrivi SALVA per crearla.`, { type:'create_service', name, cat, tipo, price:Number.isFinite(amount)?amount:0, query:text }, actionButtons('save'));
+  }
+  const serviceText = serviceTextFromRequest(text) || text;
+  const svc = resolveServices(serviceText, ctx.services);
+  const list = svc.alternatives.length ? svc.alternatives : svc.matches;
+  if (!list.length) return response('Non trovo la voce listino da modificare. Scrivimi il nome più preciso della prestazione/farmaco/fiala.');
+  if (svc.ambiguous && list.length > 1) return response('Ho trovato più voci listino possibili:\n' + list.map((p,i)=>`${i+1}) ${p.nome}${p.price ? ' · ' + euro(p.price) : ''}`).join('\n') + '\nQuale devo usare?');
+  const service = list[0];
+  if (isDelete) return response(`Ho preparato l'eliminazione della voce listino ${service.nome}. Scrivi ELIMINA per cancellarla.`, { type:'delete_service', serviceId: service.id, serviceName: service.nome, query:text }, actionButtons('delete'));
+  if (!Number.isFinite(amount)) return response(`Che prezzo devo impostare per ${service.nome}? Scrivimi ad esempio: prezzo ${service.nome} a 45 euro.`);
+  const companyRes = /\b(per|da|azienda|cliente)\b/.test(n) ? resolveCompany(text, ctx.companies, { allowWeak: true }) : { match:null };
+  const action = { type:'update_service', serviceId: service.id, serviceName: service.nome, fields:{ price: amount }, companyId: companyRes.match?.id || '', companyName: companyRes.match?.nome || '', query:text };
+  return response(`Ho preparato il nuovo prezzo ${companyRes.match ? 'specifico per ' + companyRes.match.nome : 'base'}:\n${service.nome}: ${euro(amount)}\nScrivi SALVA per aggiornare il listino.`, action, actionButtons('save'));
+}
+function invoiceCandidates(text, ctx) {
+  const n = norm(text);
+  const numMatch = safeText(text).match(/(?:fattura\s*(?:n\.?|numero)?\s*|n\.?\s*)(\d{1,8})/i);
+  const filters = managementFilters(text, ctx, /\boggi\b/.test(n) ? 'today' : 'all');
+  return ctx.invoices.filter(f => {
+    if (numMatch && String(f.numero || f.id) !== String(numMatch[1]) && String(f.id) !== String(numMatch[1])) return false;
+    if (filters.period && !inRange(f.data, filters.period)) return false;
+    if (filters.company && String(f.aziendaId) !== String(filters.company.id) && norm(f.azienda) !== norm(filters.company.nome)) return false;
+    return true;
+  }).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.numero||b.id).localeCompare(String(a.numero||a.id))).slice(0, 12);
+}
+function invoiceMutationRequest(text, ctx) {
+  const n = norm(text);
+  if (!/\bfattur/.test(n)) return null;
+  const create = /\b(emetti|genera|crea|prepara|fai)\b/.test(n) && /\bfattura\b/.test(n);
+  const paid = /\b(segna|marca|metti|imposta|cambia)\b/.test(n) && /\b(pagata|pagato|incassata|incassato|non pagata|da pagare)\b/.test(n);
+  const del = /\b(annulla|elimina|cancella|rimuovi)\b/.test(n) && /\bfattura\b/.test(n);
+  if (!create && !paid && !del) return null;
+  if (create) {
+    const cRes = resolveCompany(text, ctx.companies, { allowWeak: true });
+    if (!cRes.match) return response('Per emettere una fattura dimmi il cliente esatto. Esempio: emetti fattura per Allevamento Rossi.');
+    const openInts = ctx.interventions.filter(i => String(i.aziendaId) === String(cRes.match.id) && !i.fatt);
+    if (!openInts.length) return response(`Non trovo interventi da fatturare per ${cRes.match.nome}.`);
+    return response(`Ho trovato ${openInts.length} interventi da fatturare per ${cRes.match.nome}, totale imponibile interventi ${euro(interventionTotal(openInts))}. Scrivi SALVA per emettere la fattura.`, { type:'create_invoice', companyId:cRes.match.id, companyName:cRes.match.nome, query:text }, actionButtons('save'));
+  }
+  const items = invoiceCandidates(text, ctx);
+  if (!items.length) return response('Non trovo la fattura. Dimmi numero fattura, cliente o periodo.');
+  if (items.length > 1) return response('Ho trovato più fatture possibili. Scegli il numero:\n' + items.map((f,i)=>`${i+1}) ${formatInvoice(f)}`).join('\n'), { type: del ? 'delete_invoice' : 'update_invoice', query:text, fields: paid ? { pagata: !/non pagata|da pagare/.test(n) } : {}, options: items.map(f=>({ invoiceId:f.id })) }, []);
+  if (del) return response(`Ho preparato l'annullamento della fattura:\n- ${formatInvoice(items[0])}\nScrivi ELIMINA per annullarla e riportare gli interventi da fatturare.`, { type:'delete_invoice', invoiceId:items[0].id, query:text }, actionButtons('delete'));
+  return response(`Ho preparato la modifica fattura:\n- ${formatInvoice(items[0])}\nNuovo stato: ${/non pagata|da pagare/.test(n) ? 'da pagare' : 'pagata'}\nScrivi SALVA per aggiornare.`, { type:'update_invoice', invoiceId:items[0].id, fields:{ pagata: !/non pagata|da pagare/.test(n) }, query:text }, actionButtons('save'));
+}
+function parseInterventionUpdates(text, ctx) {
+  const n = norm(text);
+  const updates = {};
+  const when = parseWhen(text, ctx.now);
+  if (when.date) updates.date = when.date;
+  if (when.time) updates.time = when.time;
+  if (when.session) updates.session = when.session;
+  if (/\bfatturat[oa]\b|\bsegna.*fatturat/.test(n)) updates.fatt = true;
+  if (/\bnon fatturat|\bda fatturare\b/.test(n)) updates.fatt = false;
+  const note = textAfter(text, /(?:nota|note|appunto|aggiungi nota)\s*[:=]?\s*(.+)$/i);
+  if (note && !/^(oggi|ieri|domani|alle|ore)\b/i.test(note)) updates.note = note;
+  const companyText = textAfter(text, /(?:cambia|modifica|sposta).{0,30}(?:azienda|cliente)\s+(?:in|a|con|da)\s+(.+?)(?:\s+(?:oggi|ieri|alle|ore|e|con|prestazione)|$)/i);
+  if (companyText) {
+    const cRes = resolveCompany(companyText, ctx.companies, { allowWeak: true });
+    if (cRes.match) { updates.companyId = cRes.match.id; updates.companyName = cRes.match.nome; }
+  }
+  let servicePart = textAfter(text, /(?:cambia|modifica|sostituisci).{0,40}(?:prestazione|voce|servizio).{0,20}(?:in|con|a)\s+(.+?)(?:\s+(?:oggi|ieri|alle|ore|note?|cliente|azienda)|$)/i);
+  if (!servicePart && /\baggiungi\b.*\b(prestazione|farmaco|fiala|servizio)\b/.test(n)) servicePart = textAfter(text, /aggiungi\s+(?:prestazione|farmaco|fiala|servizio)?\s*(.+?)(?:\s+(?:oggi|ieri|alle|ore|note?)|$)/i);
+  if (servicePart) {
+    const sv = detectRequestedServices(servicePart, ctx.services, { max: 8 });
+    if (sv.length) updates.services = sv.map(s => ({ id:s.id, name:s.nome || s.name, qty:s.qty || 1 }));
+  }
+  return updates;
+}
+function isUpdateInterventionRequest(text) {
+  const n = norm(text);
+  return /\b(modifica|cambia|aggiorna|correggi|sposta|segna|marca|metti|aggiungi nota|nota)\b/.test(n) && /\b(intervento|prestazione|visita|cesar|fecond|insemin|ecograf|mastit|metrit|fatturat|nota|ore|ora|giorno|data)\b/.test(n);
+}
+function updateInterventionRequest(text, ctx) {
+  if (!isUpdateInterventionRequest(text)) return null;
+  const filters = managementFilters(text, ctx, /\boggi\b/.test(norm(text)) ? 'today' : 'ytd');
+  const items = filterInterventions(ctx, filters).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora))).slice(0,12);
+  const updates = parseInterventionUpdates(text, ctx);
+  if (!Object.keys(updates).length) return response('Che cosa devo cambiare dell’intervento? Posso modificare data, ora, cliente, prestazioni, note o stato fatturato.');
+  if (!items.length) return response(`Non trovo l'intervento da modificare per ${displayScope(filters) || periodLabel(filters.period)}. Dimmi cliente, giorno e prestazione.`);
+  const lines = Object.entries(updates).map(([k,v]) => `${k}: ${Array.isArray(v) ? v.map(x=>`${x.name || x.nome} x${x.qty || 1}`).join(', ') : v}`).join('\n');
+  if (items.length === 1) return response(`Ho preparato questa modifica:\n- ${formatIntervention(items[0])}\n${lines}\nScrivi SALVA per applicarla.`, { type:'update_intervention', interventionId:items[0].id, updates, query:text }, actionButtons('save'));
+  return response(`Ho trovato più interventi possibili. Scegli il numero:\n` + items.map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), { type:'update_intervention', query:text, updates, options:items.map(i=>({interventionId:i.id})) }, []);
+}
+function settingsMutationRequest(text, ctx) {
+  const n = norm(text);
+  if (!/\b(iva|km|chilometri|tariffa|rimborso|casa|indirizzo di casa|email|telefono|cellulare|impostazioni|configurazione)\b/.test(n)) return null;
+  if (!/\b(imposta|metti|cambia|modifica|aggiorna|porta)\b/.test(n)) return null;
+  const fields = {};
+  const iva = safeText(text).match(/\biva\b\s*(?:al|a|=|:)?\s*(0|4|5|10|22)\s*%?/i);
+  if (iva) fields.iva = Number(iva[1]);
+  const km = safeText(text).match(/(?:tariffa|rimborso|km|chilometri).{0,40}?(\d+(?:[.,]\d{1,2}))/i);
+  const user = resolveUser(text, ctx.users, ctx.currentUser);
+  if (km && user) fields.kmRate = { userId:user.id, userName:user.name, value:num(km[1], 0) };
+  const home = textAfter(text, /(?:casa|indirizzo di casa)\s+(?:di\s+\w+\s+)?(?:e|è|=|:|a|in)?\s*(.+)$/i);
+  if (home && user) fields.home = { userId:user.id, userName:user.name, value:home };
+  const email = safeText(text).match(/(?:email|mail)\s*(?:e|è|=|:|a|in)?\s*([^,;.\s]+@[^,;.\s]+)/i);
+  if (email && user) fields.email = { userId:user.id, userName:user.name, value:email[1] };
+  const tel = textAfter(text, /(?:telefono|cellulare|tel)\s*(?:e|è|=|:|a|in)?\s*([^,;.]+)/i);
+  if (tel && user) fields.tel = { userId:user.id, userName:user.name, value:tel };
+  if (!Object.keys(fields).length) return null;
+  const lines = Object.entries(fields).map(([k,v]) => typeof v === 'object' ? `${k} ${v.userName}: ${v.value}` : `${k}: ${v}`).join('\n');
+  return response(`Ho preparato la modifica impostazioni:\n${lines}\nScrivi SALVA per applicarla.`, { type:'update_settings', fields, query:text }, actionButtons('save'));
 }
 
 async function openAIJson(messages, maxTimeout = OPENAI_TIMEOUT_MS) {
@@ -585,7 +929,7 @@ function managementFilters(text, ctx, defaultPeriod = 'ytd') {
   const user = resolveUser(text, ctx.users, ctx.currentUser);
   const cRes = resolveCompany(text, ctx.companies, { allowWeak: true });
   const company = cRes.match;
-  const serviceText = serviceTextFromRequest(text);
+  const serviceText = extractServiceFilter(text, ctx);
   return { period, user, company, companyResult: cRes, serviceText };
 }
 function interventionQuery(text, ctx) {
@@ -684,16 +1028,20 @@ function createInterventionRequest(text, ctx) {
     const guessed = (safeText(text).match(/\bda\s+(.+?)(?:\s+(?:oggi|ieri|alle|ore|mattina|pomeriggio|sera|notte)|$)/i) || [])[1] || '';
     return { reply: `Non trovo il cliente${guessed ? ' "' + guessed.trim() + '"' : ''} nel gestionale. Vuoi crearlo? Scrivi: CREA CLIENTE con ragione sociale e indirizzo.`, action: { type: 'create_intervention', companyName: guessed.trim(), companyId: '', services: [], date: '', time: '', session: '', note: 'Cliente non riconosciuto' }, actions: [], learn: [] };
   }
-  const serviceText = serviceTextFromRequest(text) || text;
-  const serviceRes = resolveServices(serviceText, ctx.services);
-  if (serviceRes.ambiguous) return { reply: 'Ho trovato più prestazioni possibili:\n' + serviceRes.alternatives.map((s,i)=>`${i+1}) ${s.nome}${s.price ? ' · ' + euro(s.price) : ''}`).join('\n') + '\nQuale devo usare?', action: null, actions: [], learn: [] };
-  if (!serviceRes.matches.length) return { reply: 'Non ho riconosciuto la prestazione. Scrivimi il nome come nel listino oppure dimmi quale voce usare.', action: null, actions: [], learn: [] };
+  const services = detectRequestedServices(text, ctx.services, { max: 10 });
+  if (!services.length) {
+    const serviceText = serviceTextFromRequest(text) || text;
+    const serviceRes = resolveServices(serviceText, ctx.services);
+    if (serviceRes.ambiguous) return response('Ho trovato più prestazioni possibili:\n' + serviceRes.alternatives.map((s,i)=>`${i+1}) ${s.nome}${s.price ? ' · ' + euro(s.price) : ''}`).join('\n') + '\nQuale devo usare?');
+    if (serviceRes.matches.length) services.push(...serviceRes.matches.map(s => ({ name:s.nome, nome:s.nome, id:s.id, qty:qtyNearService(text, s.nome) })));
+  }
+  if (!services.length) return response('Non ho riconosciuto la prestazione. Scrivimi il nome come nel listino oppure dimmi quale voce usare.');
   const when = parseWhen(text, ctx.now);
-  const services = serviceRes.matches.map(s => ({ name: s.nome, id: s.id, qty: qtyNearService(text, s.nome) }));
-  const action = { type: 'create_intervention', companyName: companyRes.match.nome, companyId: companyRes.match.id || '', services, date: when.date || '', time: when.time || '', session: when.session || '', note: 'Preparato da Rural Vet AI' };
-  const line = services.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', ');
-  if (!action.date || !action.time) return { reply: `Ho capito: ${line} da ${companyRes.match.nome}.\nQuando lo registro? Scrivi ADESSO oppure data e ora, esempio: oggi 14:30.`, action, actions: [], learn: [] };
-  return { reply: `Ho capito: ${line} da ${companyRes.match.nome}, ${action.date} ore ${action.time}.\nScrivi SALVA per registrare nel gestionale.`, action, actions: [], learn: [] };
+  const cleanServices = services.map(s => ({ name: s.name || s.nome, id: s.id, qty: Math.max(1, num(s.qty, 1)) }));
+  const action = { type: 'create_intervention', companyName: companyRes.match.nome, companyId: companyRes.match.id || '', services: cleanServices, date: when.date || '', time: when.time || '', session: when.session || '', note: 'Preparato da Rural Vet AI' };
+  const line = cleanServices.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', ');
+  if (!action.date || !action.time) return response(`Ho capito: ${line} da ${companyRes.match.nome}.\nQuando lo registro?`, action, actionButtons('when'));
+  return response(`Ho capito: ${line} da ${companyRes.match.nome}, ${action.date} ore ${action.time}.\nScrivi SALVA per registrare nel gestionale.`, action, actionButtons('save'));
 }
 function deleteInterventionRequest(text, ctx) {
   if (!isDeleteRequest(text)) return null;
@@ -704,7 +1052,7 @@ function deleteInterventionRequest(text, ctx) {
   return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
 }
 function deterministicRouter(text, ctx) {
-  const handlers = [learnQuery, createClientRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, revenueQuery, interventionQuery, dashboardQuery];
+  const handlers = [managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
   for (const h of handlers) {
     const ans = h(text, ctx);
     if (ans) return ans;
@@ -721,7 +1069,7 @@ function catalogDigest(ctx) {
 async function planner(text, ctx) {
   if (!process.env.OPENAI_API_KEY) return null;
   const prompt = `Sei un router di intenti per il gestionale Rural Vet. Non rispondere all'utente. Devi solo trasformare la richiesta in JSON.
-Intenti possibili: client_lookup, client_count, service_lookup, intervention_query, revenue_query, invoice_query, km_query, create_intervention, delete_intervention, create_client, learn, clinical, general.
+Intenti possibili: client_lookup, client_count, service_lookup, intervention_query, revenue_query, analytics_query, invoice_query, km_query, create_intervention, update_intervention, delete_intervention, create_client, update_client, delete_client, create_service, update_service, delete_service, create_invoice, update_invoice, delete_invoice, update_settings, learn, clinical, general.
 Campi: companyText, userText, serviceText, periodText, fields, paidStatus.
 Rispondi solo JSON valido con schema: {"intent":"...","companyText":"","userText":"","serviceText":"","periodText":"","fields":[],"paidStatus":"","confidence":0.0}`;
   const data = { request: safeText(text, MAX_INPUT_CHARS), catalog: catalogDigest(ctx), currentUser: ctx.currentUser };
@@ -739,20 +1087,27 @@ function executePlan(plan, text, ctx) {
   if (intent === 'client_count') return countClients('quanti clienti', ctx);
   if (intent === 'service_lookup') return serviceLookup([text, safeText(plan.serviceText, 200), 'prezzo listino'].join(' '), ctx);
   if (intent === 'intervention_query') return interventionQuery(pText + ' interventi riepilogo', ctx);
-  if (intent === 'revenue_query' || intent === 'invoice_query') return revenueQuery(pText + ' fatturato ricavi fatture', ctx);
+  if (intent === 'revenue_query' || intent === 'invoice_query' || intent === 'analytics_query') return analyticsQuery(pText + ' fatturato ricavi fatture analisi', ctx) || revenueQuery(pText + ' fatturato ricavi fatture', ctx);
   if (intent === 'km_query') return kmQuery(pText + ' km', ctx);
   if (intent === 'create_intervention') return createInterventionRequest(text, ctx);
+  if (intent === 'update_intervention') return updateInterventionRequest(text, ctx);
   if (intent === 'delete_intervention') return deleteInterventionRequest(text, ctx);
   if (intent === 'create_client') return createClientRequest(text, ctx);
+  if (intent === 'update_client' || intent === 'delete_client') return companyMutationRequest(text, ctx);
+  if (intent === 'create_service' || intent === 'update_service' || intent === 'delete_service') return serviceMutationRequest(text, ctx);
+  if (intent === 'create_invoice' || intent === 'update_invoice' || intent === 'delete_invoice') return invoiceMutationRequest(text, ctx);
+  if (intent === 'update_settings') return settingsMutationRequest(text, ctx);
   if (intent === 'learn') return learnQuery(text, ctx);
   return null;
 }
 
 function buildGeneralPrompt() {
   return `Sei Rural Vet AI dentro un gestionale veterinario buiatrico.
-Rispondi in italiano, breve e operativo. Restituisci sempre JSON valido con almeno il campo reply.
-Non inventare dati del gestionale: se chiede numeri, clienti, fatture, P.IVA, interventi o km e non li hai nei dati, dillo.
-Per clinica buiatrica: diagnosi probabile se possibile, massimo 2 differenziali, massimo 3 domande mirate. Non fare spiegoni.`;
+Rispondi in italiano, breve, pratico e intelligente. Restituisci sempre JSON valido con almeno il campo reply.
+Quando l'utente chiede dati gestionali non inventare: usa solo il contesto ricevuto.
+Quando propone una modifica al gestionale, se non sei sicuro non eseguire e chiedi il campo mancante. Le modifiche devono essere restituite come action JSON e verranno salvate solo dopo SALVA/ELIMINA.
+Azioni supportate: create_intervention, update_intervention, delete_intervention, create_client, update_client, delete_client, create_service, update_service, delete_service, create_invoice, update_invoice, delete_invoice, update_settings.
+Per clinica buiatrica: diagnosi probabile, 2-4 differenziali se utili, urgenza/triage, cosa controllare subito, terapia solo come orientamento clinico prudente, massimo 3 domande mirate. Non sostituire visita, ricetta e tempi di sospensione.`;
 }
 function generalPayload(body, ctx) {
   return {
@@ -803,7 +1158,10 @@ function validateAction(result, ctx) {
         for (const s of a.services) if (s.id && !ctx.services.some(p => String(p.id) === String(s.id))) s.id = '';
       }
     }
-    if (a.type === 'delete_intervention' && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) a.interventionId = '';
+    if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) a.interventionId = '';
+    if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) a.companyId = '';
+    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) a.serviceId = '';
+    if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) a.invoiceId = '';
   }
   return result;
 }
@@ -823,19 +1181,19 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     if (!text.trim()) return res.json({ reply: 'Scrivimi cosa vuoi sapere o fare nel gestionale.', action: null, actions: [], learn: [], source: 'empty' });
 
     let result = deterministicRouter(text, ctx);
-    let source = 'deterministic-v6';
+    let source = 'deterministic-v8';
 
     if (!result && looksManagement(text)) {
       try {
         const plan = await planner(text, ctx);
         result = executePlan(plan, text, ctx);
-        source = 'planner-v6';
+        source = 'planner-v8';
       } catch (err) {
         console.warn('Planner non riuscito:', err.message);
       }
       if (!result) {
         result = { reply: 'Non sono riuscito a trovare quel dato nel gestionale con sicurezza. Dimmi cliente/prestazione/periodo in modo più preciso oppure aggiorna il gestionale e riprova.', action: null, actions: [], learn: [] };
-        source = 'safe-no-data-v6';
+        source = 'safe-no-data-v8';
       }
     }
 
@@ -845,10 +1203,10 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     }
 
     result = validateAction(result, ctx);
-    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 4000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v6', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
+    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
-    res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v6' });
+    res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
   }
 });
 
