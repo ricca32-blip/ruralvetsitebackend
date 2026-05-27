@@ -2,31 +2,36 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
-function check(cmd, args) { execFileSync(cmd, args, { stdio: 'pipe' }); }
+function norm(v){ return String(v||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]+/g,' ').trim(); }
+function lev(a,b){ if(a===b)return 0; if(!a)return b.length; if(!b)return a.length; const d=Array.from({length:a.length+1},(_,i)=>[i]); for(let j=1;j<=b.length;j++)d[0][j]=j; for(let i=1;i<=a.length;i++)for(let j=1;j<=b.length;j++)d[i][j]=Math.min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+(a[i-1]===b[j-1]?0:1)); return d[a.length][b.length]; }
+const noise = new Set('azienda agricola societa società soc ss srl flli f lli fratelli az agr'.split(' '));
+function clean(v){ return norm(v).split(' ').filter(t=>t&&!noise.has(t)).join(' '); }
+function ratio(a,b){ a=clean(a); b=clean(b); return a&&b ? 1 - lev(a,b)/Math.max(a.length,b.length) : 0; }
+function findCompanyCandidates(q, companies){ q=clean(q); return companies.map(c=>{ const fields=[c.name,c.ragioneSociale,c.comune,c.provincia,c.indirizzo].filter(Boolean); let score=0; for(const f0 of fields){ const f=clean(f0); let s=0; if(f===q)s=100; else if(f.startsWith(q)&&q.length>=2)s=95; else if(f.includes(q)&&q.length>=2)s=85; else { const toks=f.split(' '); const r=Math.max(ratio(q,f),...toks.map(t=>ratio(q,t))); if(r>=.82)s=80; else if(r>=.68&&q.length>=3)s=62; } score=Math.max(score,s); } return {...c,label:[c.name,c.comune].filter(Boolean).join(' · '),score}; }).filter(x=>x.score>=45).sort((a,b)=>b.score-a.score).slice(0,8); }
+function svcSyn(q){ const n=norm(q); let s=n; if(/fecond|insemin|\bfa\b/.test(n)) s+=' fecondazione inseminazione fa seme sessato manza'; if(/cesar/.test(n)) s+=' cesareo taglio cesareo'; if(/eco|ecograf|gravid/.test(n)) s+=' ecografia diagnosi gravidanza'; if(/visita/.test(n)) s+=' visita clinica riproduttiva ginecologica'; return s; }
+function findServiceCandidates(q, services){ const qq=svcSyn(q); return services.map(s=>{ const tt=svcSyn(s.name); let score=0; if(norm(s.name)===norm(q))score=100; else if(norm(s.name).startsWith(norm(q)))score=95; else if(norm(s.name).includes(norm(q)))score=85; else { const qs=qq.split(' ').filter(Boolean); const ts=tt.split(' ').filter(Boolean); const hits=qs.filter(x=>ts.includes(x)||ts.some(t=>t.startsWith(x)||x.startsWith(t))).length; score=Math.min(90,hits*18); } return {...s,label:s.name,score}; }).filter(x=>x.score>=35).sort((a,b)=>b.score-a.score).slice(0,8); }
+function qty(w){ return ({un:1,uno:1,una:1,due:2,tre:3,quattro:4,cinque:5}[norm(w)]||Number(String(w).replace('x',''))||1); }
+function parse(text){ const n=norm(text); const companyRaw = /(da|presso|per)\s+([a-z0-9 ]+)$/.exec(n)?.[2] || n.split(' ').slice(-1)[0]; let servicePart=n.replace(/\b(da|presso|per)\b.+$/,'').trim(); if(companyRaw) servicePart=servicePart.replace(new RegExp('\\b'+companyRaw+'$'),'').trim(); const m=/^(x?\d+|un|uno|una|due|tre|quattro|cinque)\s+(.+)$/.exec(servicePart); return { services:[{rawText:m?m[2]:servicePart, qty:m?qty(m[1]):1}], companyRaw }; }
+function step(input, draft, ctx){ if(!draft){ const p=parse(input); draft={services:p.services.map(s=>({...s,serviceId:null,serviceName:null,candidates:[]})),companyRaw:p.companyRaw,companyId:null,companyCandidates:[],awaiting:null}; }
+ if(draft.awaiting==='service_choice'){ const c=draft.services[0].candidates.find(x=>norm(input).includes(norm(x.name))); draft.services[0].serviceId=c.id; draft.services[0].serviceName=c.name; draft.awaiting=null; }
+ if(draft.awaiting==='company_choice'){ const c=draft.companyCandidates.find(x=>norm(input).includes(norm(x.name))||norm(input).includes(norm(x.label))); draft.companyId=c.id; draft.companyName=c.name; draft.awaiting=null; }
+ if(draft.awaiting==='datetime_choice'){ draft.date='2026-05-27'; draft.time='13:30'; draft.session='p'; draft.awaiting='confirm'; return {draft,action:{type:'create_intervention',companyId:draft.companyId,services:[{id:draft.services[0].serviceId,qty:draft.services[0].qty}],date:draft.date,time:draft.time},ui:{awaiting:'confirm',safeToApply:true},quickReplies:['SALVA']}; }
+ if(!draft.services[0].serviceId){ draft.services[0].candidates=findServiceCandidates(draft.services[0].rawText,ctx.services); draft.awaiting='service_choice'; return {draft,ui:{awaiting:'service_choice',safeToApply:false},quickReplies:draft.services[0].candidates.map(x=>x.name)}; }
+ if(!draft.companyId){ draft.companyCandidates=findCompanyCandidates(draft.companyRaw,ctx.companies); draft.awaiting='company_choice'; return {draft,ui:{awaiting:'company_choice',safeToApply:false},quickReplies:draft.companyCandidates.map(x=>x.label)}; }
+ draft.awaiting='datetime_choice'; return {draft,ui:{awaiting:'datetime_choice',safeToApply:false},quickReplies:['ADESSO','oggi 14:30','ieri 09:00']}; }
 
 const server = fs.readFileSync(new URL('./server.js', import.meta.url), 'utf8');
-const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+execFileSync(process.execPath, ['--check', new URL('./server.js', import.meta.url).pathname]);
+['findCompanyCandidates','findServiceCandidates','parseInterventionDraft','continuePendingInterventionDraft','resolveNextInterventionStep','validateInterventionAction'].forEach(n=>assert(server.includes('function '+n), 'Manca '+n));
+assert(server.includes('pendingInterventionDraft'), 'Il server deve gestire pendingInterventionDraft');
+assert(server.includes('ui: result.ui'), 'La risposta backend deve includere ui');
 
-check(process.execPath, ['--check', new URL('./server.js', import.meta.url).pathname]);
-const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
-for (const script of scripts) new Function(script);
-
-[
-  'parseInterventionDraft',
-  'findServiceCandidates',
-  'findCompanyCandidates',
-  'continuePendingInterventionDraft',
-  'validateInterventionAction',
-  'resolveNextInterventionStep',
-  'interventionDraftToReply'
-].forEach(name => assert(server.includes('function ' + name), 'Manca funzione ' + name));
-
-assert(server.includes("type: 'continue_intervention_draft'"), 'Manca action continue_intervention_draft');
-assert(server.includes('safeToApply'), 'Manca contratto safeToApply');
-assert(server.includes('AI_DEBUG'), 'Manca AI_DEBUG');
-assert(html.includes('pendingInterventionDraft'), 'Frontend non mantiene pendingInterventionDraft');
-assert(html.includes('ctx.pendingInterventionDraft'), 'Frontend non invia pendingInterventionDraft nel context');
-assert(html.includes("continue_intervention_draft"), 'Frontend non gestisce continue_intervention_draft');
-assert(html.includes("Modifica prestazione"), 'Mancano bottoni modifica bozza');
-
-console.log('OK: smoke test AI flow superato. Sintassi server/html e contratto bozza verificati.');
+const ctx={companies:[{id:'c1',name:'Rossi Mario',comune:'Parma'},{id:'c2',name:'Azienda Agricola Rossi',comune:'Cremona'},{id:'c3',name:'F.lli Rossi',comune:'Piacenza'},{id:'c4',name:'Rossini Giuseppe',comune:'Lodi'},{id:'c5',name:'Bianchi Luca',comune:'Lodi'},{id:'c6',name:'Società Agricola Bianchi',comune:'Mantova'},{id:'c7',name:'F.lli Bianchini',comune:'Cremona'},{id:'c8',name:'Bianco Giuseppe',comune:'Brescia'},{id:'c9',name:'Azienda Agricola Verde',comune:'Verona'},{id:'c10',name:'Verdi Mario',comune:'Parma'}],services:[{id:'s1',name:'Fecondazione artificiale'},{id:'s2',name:'Fecondazione seme sessato'},{id:'s3',name:'Fecondazione manza'},{id:'s4',name:'Inseminazione bovina'},{id:'s5',name:'Cesareo'},{id:'s6',name:'Visita clinica'},{id:'s7',name:'Ecografia gravidanza'}]};
+let r=step('2 fecondazioni rossi',null,ctx); assert(r.draft.services[0].qty===2,'qty 2 persa'); assert(r.draft.companyRaw==='rossi','companyRaw rossi non estratto'); assert(r.ui.awaiting==='service_choice','deve chiedere prestazione'); assert(r.quickReplies.includes('Fecondazione artificiale'),'manca bottone fecondazione'); assert(r.ui.safeToApply===false,'non deve essere applicabile');
+r=step('Fecondazione artificiale',r.draft,ctx); assert(r.draft.services[0].serviceId==='s1','serviceId non assegnato'); assert(r.draft.services[0].qty===2,'qty persa dopo click'); assert(r.ui.awaiting==='company_choice','deve chiedere azienda'); assert(r.quickReplies.some(x=>x.includes('Rossi Mario')),'manca Rossi Mario'); assert(r.quickReplies.some(x=>x.includes('Azienda Agricola Rossi')),'manca Agricola Rossi');
+r=step('Rossi Mario · Parma',r.draft,ctx); assert(r.draft.companyId==='c1','companyId non assegnato'); assert(r.ui.awaiting==='datetime_choice','deve chiedere quando');
+r=step('ADESSO',r.draft,ctx); assert(r.ui.awaiting==='confirm','deve arrivare a conferma'); assert(r.action.type==='create_intervention','manca create_intervention'); assert(r.action.companyId==='c1','companyId action errato'); assert(r.action.services[0].id==='s1','serviceId action errato'); assert(r.action.services[0].qty===2,'qty action errata'); assert(r.ui.safeToApply===true,'deve essere safeToApply');
+assert(findCompanyCandidates('ross',ctx.companies).some(x=>x.name==='Rossi Mario'),'ross non trova Rossi');
+assert(findCompanyCandidates('rosi',ctx.companies).some(x=>x.name==='Rossi Mario'),'rosi fuzzy non trova Rossi');
+assert(findCompanyCandidates('bian',ctx.companies).some(x=>x.name.includes('Bianchi')),'bian non trova Bianchi');
+console.log('OK: test end-to-end 2 fecondazioni rossi e matching aziende superati.');

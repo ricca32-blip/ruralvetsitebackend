@@ -336,7 +336,7 @@ function buildContext(reqBody = {}) {
   const interventions = compactInterventions(raw, shell);
   const invoices = compactInvoices(raw, { ...shell, interventions });
   const kmRoutes = compactKm(raw);
-  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now: new Date() };
+  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, pendingInterventionDraft: raw.pendingInterventionDraft || null, now: new Date() };
 }
 
 function meaningfulTokens(s) {
@@ -438,6 +438,304 @@ function qtyNearService(text, serviceName) {
   }
   return 1;
 }
+
+// Rural Vet AI intervention wizard: deterministic, data-first, button-first.
+const COMPANY_NOISE = new Set('azienda aziende agricola agricolo societa società soc ss s srl snc sas flli f lli fratelli az agr allevamento allevamenti ditta'.split(' '));
+function cleanMatchText(value) {
+  return norm(value).split(' ').filter(t => t && !COMPANY_NOISE.has(t)).join(' ');
+}
+function compactCompanyFields(c) {
+  const raw = c?.raw || {};
+  return [
+    c?.nome, c?.ragioneSociale, c?.comune, c?.provincia, c?.indirizzo, c?.addr, c?.piva, c?.cf, c?.tel, c?.email,
+    raw.name, raw.nome, raw.companyName, raw.displayName, raw.ragioneSociale, raw.legalName, raw.owner, raw.titolare,
+    raw.referente, raw.city, raw.comune, raw.province, raw.provincia, raw.address, raw.indirizzo, raw.partitaIva,
+    raw.vat, raw.codiceFiscale, raw.telefono, raw.phone, raw.alias, raw.notes, raw.note
+  ].flatMap(v => Array.isArray(v) ? v : [v]).filter(Boolean).map(v => safeText(v, 260));
+}
+function labelCompany(c) {
+  return [c?.nome || c?.ragioneSociale || 'Azienda', c?.comune || c?.provincia || ''].filter(Boolean).join(' · ');
+}
+function fuzzyRatio(a, b) {
+  a = cleanMatchText(a); b = cleanMatchText(b);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const dist = levenshtein(a, b);
+  return 1 - dist / Math.max(a.length, b.length, 1);
+}
+function scoreCompanyCandidate(query, company, ctx = {}) {
+  const q = cleanMatchText(query);
+  if (!q) return { score: 0, reason: 'empty' };
+  const fields = compactCompanyFields(company);
+  let best = { score: 0, reason: 'none' };
+  const qTokens = q.split(' ').filter(Boolean);
+  for (const f0 of fields) {
+    const f = cleanMatchText(f0);
+    if (!f) continue;
+    let score = 0, reason = '';
+    if (f === q) { score = 100; reason = 'exact'; }
+    else if (f.startsWith(q) && q.length >= 2) { score = 95; reason = 'startsWith'; }
+    else if (f.includes(q) && q.length >= 2) { score = 85; reason = 'contains'; }
+    else {
+      const fTokens = f.split(' ').filter(Boolean);
+      let tokenHits = 0;
+      for (const qt of qTokens) {
+        if (fTokens.some(ft => ft === qt || ft.startsWith(qt) || qt.startsWith(ft))) tokenHits++;
+        else if (qt.length >= 3 && fTokens.some(ft => fuzzyRatio(qt, ft) >= 0.72)) tokenHits++;
+      }
+      if (tokenHits) { score = 55 + Math.min(30, tokenHits * 12); reason = 'token'; }
+      const ratio = Math.max(...fTokens.map(ft => fuzzyRatio(q, ft)), fuzzyRatio(q, f));
+      if (ratio >= 0.82) { score = Math.max(score, 80); reason = reason || 'fuzzy'; }
+      else if (ratio >= 0.68 && q.length >= 3) { score = Math.max(score, 62); reason = reason || 'fuzzy-low'; }
+    }
+    if (score > best.score) best = { score, reason };
+  }
+  const recentNames = new Set(asArray(ctx?.interventions).slice(0, 80).map(i => String(i.aziendaId || i.companyId || '')).filter(Boolean));
+  if (recentNames.has(String(company?.id)) && best.score >= 45) best.score += 8;
+  return best;
+}
+function findCompanyCandidates(query, companies, options = {}) {
+  const ctx = options.ctx || {};
+  const q = safeText(query, 300);
+  const scored = asArray(companies).map(c => {
+    const r = scoreCompanyCandidate(q, c, ctx);
+    return { id: c.id, name: c.nome || c.ragioneSociale || '', label: labelCompany(c), score: r.score, reason: r.reason, company: c };
+  }).filter(x => x.score >= (options.lowThreshold || 45)).sort((a,b) => b.score - a.score || String(a.label).localeCompare(String(b.label), 'it'));
+  if (process.env.AI_DEBUG === 'true') console.log('[AI COMPANY MATCH]', JSON.stringify({ query:q, normalized:cleanMatchText(q), companies:asArray(companies).length, top:scored.slice(0,10).map(x=>({name:x.name,score:x.score,reason:x.reason})) }));
+  return uniqueBy(scored, x => String(x.id || x.label)).slice(0, options.max || 8);
+}
+function serviceSynonyms(raw) {
+  const n = canonicalServiceText(raw);
+  const words = [n];
+  if (/fecond|insemin|\bfa\b/.test(n)) words.push('fecondazione inseminazione fa seme sessato manza');
+  if (/cesar|taglio/.test(n)) words.push('cesareo taglio cesareo cesario');
+  if (/eco|ecograf|gravid/.test(n)) words.push('ecografia eco diagnosi gravidanza controllo gravidanza');
+  if (/visita|clin|riprod|ginecol/.test(n)) words.push('visita clinica riproduttiva ginecologica');
+  if (/mastit/.test(n)) words.push('mastite terapia mastite visita mastite');
+  if (/metrit|post parto|puerper/.test(n)) words.push('metrite terapia metrite post parto puerperio');
+  if (/vaccin/.test(n)) words.push('vaccino vaccinazione');
+  if (/podal|zopp|pareggio/.test(n)) words.push('podale zoppia controllo podale pareggio');
+  if (/parto/.test(n)) words.push('parto assistenza parto');
+  if (/sangue|preliev/.test(n)) words.push('sangue prelievo sangue');
+  if (/feci/.test(n)) words.push('feci esame feci prelievo feci');
+  if (/abomas|disloc/.test(n)) words.push('abomaso dislocazione abomaso');
+  if (/calcio|ipocalc|flebo|endoven/.test(n)) words.push('calcio ipocalcemia endovena flebo terapia endovenosa');
+  return words.join(' ');
+}
+function scoreServiceCandidate(query, service) {
+  const q = serviceSynonyms(query);
+  const target = serviceSynonyms(service?.nome || service?.name || '');
+  const rawQ = canonicalServiceText(query);
+  const rawT = canonicalServiceText(service?.nome || service?.name || '');
+  let score = tokenScore(q, target, { strong: true });
+  if (rawT === rawQ) score = Math.max(score, 100);
+  else if (rawT.startsWith(rawQ) && rawQ.length >= 2) score = Math.max(score, 95);
+  else if (rawT.includes(rawQ) && rawQ.length >= 3) score = Math.max(score, 85);
+  return Math.min(110, score);
+}
+function findServiceCandidates(query, services, options = {}) {
+  const scored = asArray(services).map(s => ({ id: s.id, name: s.nome, label: s.nome + (s.price ? ' · ' + euro(s.price) : ''), score: scoreServiceCandidate(query, s), service: s }))
+    .filter(x => x.score >= (options.lowThreshold || 35))
+    .sort((a,b) => b.score - a.score || String(a.name).localeCompare(String(b.name), 'it'));
+  return uniqueBy(scored, x => String(x.id || x.name)).slice(0, options.max || 8);
+}
+function parseQtyWord(word) {
+  const w = norm(word);
+  if (/^x?\d+$/.test(w)) return Math.max(1, Number(w.replace('x','')));
+  return NUMBER_WORDS.get(w) || (w === 'doppia' ? 2 : w === 'tripla' ? 3 : 1);
+}
+function stripWhenAndCompany(text) {
+  return safeText(text, 1000)
+    .replace(/\b(?:oggi|ieri|domani|stamattina|questa mattina|pomeriggio|stasera|sera|notte|mattina)\b/ig, ' ')
+    .replace(/\b(?:alle|ore)\s*\d{1,2}(?::|\.)?\d{0,2}\b/ig, ' ')
+    .replace(/\b\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?\b/g, ' ')
+    .trim();
+}
+function extractCompanyPhrase(text, ctx) {
+  const raw = stripWhenAndCompany(text);
+  let m = raw.match(/\b(?:da|presso|per|azienda|cliente)\s+(.+)$/i);
+  if (m) return safeText(m[1].replace(/[,.].*$/, ''), 140).trim();
+  const tokens = norm(raw).split(' ').filter(Boolean);
+  if (tokens.length >= 2) {
+    for (let take = Math.min(3, tokens.length - 1); take >= 1; take--) {
+      const tail = tokens.slice(-take).join(' ');
+      const c = findCompanyCandidates(tail, ctx.companies, { ctx, lowThreshold: 45, max: 3 });
+      if (c.length) return tail;
+    }
+  }
+  return '';
+}
+function extractServicePhrases(text, ctx) {
+  let raw = stripWhenAndCompany(text);
+  raw = raw.replace(/\b(?:ho fatto|ho eseguito|registra|inserisci|aggiungi|segna|metti|intervento|interventi)\b/ig, ' ');
+  raw = raw.replace(/\b(?:da|presso|per|azienda|cliente)\s+.+$/i, ' ');
+  const companyRaw = extractCompanyPhrase(text, ctx);
+  if (companyRaw) raw = raw.replace(new RegExp('\\b' + companyRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i'), ' ');
+  const parts = raw.split(/[,;+]|\s+e\s+|\s+piu\s+|\s+più\s+|\s+con\s+/i).map(x => x.trim()).filter(Boolean);
+  const out = [];
+  for (let part of parts) {
+    part = part.replace(/^\s*(?:un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|x?\d+)\s+/i, m => { part._qtyWord = m.trim(); return ''; });
+    const qmatch = parts.length ? null : null;
+    let qty = 1;
+    const m = part.match(/^\s*(x?\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|doppia|tripla)\s+(.+)$/i);
+    if (m) { qty = parseQtyWord(m[1]); part = m[2]; }
+    else {
+      const original = raw.match(new RegExp('(?:^|\\s)(x?\\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\\s+' + part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+      if (original) qty = parseQtyWord(original[1]);
+    }
+    part = safeText(part.replace(/\b(?:da|presso|per)\b.*$/i, '').trim(), 140);
+    if (part && meaningfulTokens(part).length) out.push({ rawText: part, qty });
+  }
+  if (!out.length) {
+    const n = norm(text);
+    const common = ['fecondazioni','fecondazione','inseminazione','cesareo','visita','ecografia','eco','mastite','metrite','vaccinazione','parto','podale','terapia'];
+    for (const w of common) if (n.includes(w)) out.push({ rawText: w, qty: qtyNearService(text, w) });
+  }
+  return out.slice(0, 8);
+}
+function extractInterventionParts(text, ctx) {
+  const when = parseWhen(text, ctx.now);
+  const servicesRaw = extractServicePhrases(text, ctx);
+  const companyRaw = extractCompanyPhrase(text, ctx);
+  let note = '';
+  const noteMatch = safeText(text, 1000).match(/\b(?:vacca|manza|vitello|animale|nota|note)\s+(.+)$/i);
+  if (noteMatch) note = safeText(noteMatch[0], 500);
+  return { servicesRaw, companyRaw, dateRaw: when.date, timeRaw: when.time, sessionRaw: when.session, note };
+}
+function isCreateInterventionIntent(text, ctx = { services: [] }) {
+  const n = norm(text);
+  if (!n) return false;
+  if (/\b(ho fatto|ho eseguito|registra|inserisci|aggiungi|segna|metti)\b/.test(n) && /(fecond|insemin|cesar|visita|eco|ecograf|mastit|metrit|terapia|vaccin|parto|podal|abomas|calcio)/.test(n)) return true;
+  if (/\b(x?\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\b.*\b(fecond|insemin|cesar|visita|eco|ecograf|mastit|metrit|terapia|vaccin|parto|podal|abomas|calcio)/.test(n)) return true;
+  if (extractServicePhrases(text, ctx).some(p => findServiceCandidates(p.rawText, ctx.services, { max: 1 }).length)) return true;
+  return false;
+}
+function draftFromText(text, ctx) {
+  const parts = extractInterventionParts(text, ctx);
+  return {
+    type: 'intervention_draft', draftId: 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2,7), originalText: safeText(text, 1000),
+    services: parts.servicesRaw.map(p => ({ rawText: p.rawText, qty: Math.max(1, num(p.qty, 1)), serviceId: null, serviceName: null, candidates: [] })),
+    companyRaw: parts.companyRaw || '', companyId: null, companyName: null, companyCandidates: [],
+    date: parts.dateRaw || null, time: parts.timeRaw || null, session: parts.sessionRaw || null,
+    userId: ctx.currentUser?.id || null, userName: ctx.currentUser?.name || '', note: parts.note || '', awaiting: null, currentServiceIndex: 0
+  };
+}
+function normalizeDraft(d) {
+  if (!d || typeof d !== 'object') return null;
+  return { ...d, type: 'intervention_draft', services: asArray(d.services).map(s => ({ rawText: s.rawText || s.name || '', qty: Math.max(1, num(s.qty, 1)), serviceId: s.serviceId || s.id || null, serviceName: s.serviceName || s.name || null, candidates: asArray(s.candidates) })), companyCandidates: asArray(d.companyCandidates) };
+}
+function wizardResult(reply, draft, quickReplies = [], extra = {}) {
+  return { reply, action: { type: 'intervention_draft', draft }, quickReplies, ui: { mode: 'intervention_wizard', awaiting: draft.awaiting || null, draftId: draft.draftId, safeToApply: false, ...(extra.ui || {}) }, clearDraft: !!extra.clearDraft };
+}
+function buildServiceChoiceReply(draft, svc) {
+  const buttons = svc.candidates.map(c => c.label || c.name).slice(0, 6).concat(['Cerca meglio','Annulla']);
+  return wizardResult(`Quale tipo di ${svc.rawText} vuoi inserire?`, draft, buttons);
+}
+function buildCompanyChoiceReply(draft) {
+  const buttons = draft.companyCandidates.map(c => c.label || c.name).slice(0, 6).concat(['Cerca meglio','Crea nuova azienda','Annulla']);
+  const q = draft.companyRaw ? ' ' + draft.companyRaw : '';
+  return wizardResult(`Quale azienda${q} intendi?`, draft, buttons);
+}
+function buildDateTimeChoiceReply(draft) {
+  return wizardResult('Quando lo registro?', draft, ['ADESSO','oggi 14:30','ieri 09:00','Solo mattina','Solo pomeriggio','Annulla']);
+}
+function validateInterventionAction(action, ctx) {
+  if (!action || action.type !== 'create_intervention') return { ok: false, reason: 'action non valida' };
+  if (!action.companyId || !ctx.companies.some(c => String(c.id) === String(action.companyId))) return { ok: false, reason: 'azienda mancante' };
+  if (!Array.isArray(action.services) || !action.services.length) return { ok: false, reason: 'prestazione mancante' };
+  for (const s of action.services) {
+    if (!s.id || !ctx.services.some(p => String(p.id) === String(s.id))) return { ok: false, reason: 'prestazione non riconosciuta' };
+    if (!Number.isFinite(Number(s.qty)) || Number(s.qty) < 1) return { ok: false, reason: 'quantita non valida' };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(action.date || ''))) return { ok: false, reason: 'data mancante' };
+  if (!/^\d{2}:\d{2}$/.test(String(action.time || '')) && !/^[mpn]$/.test(String(action.session || ''))) return { ok: false, reason: 'ora/sessione mancante' };
+  return { ok: true };
+}
+function buildFinalInterventionAction(draft, ctx) {
+  const company = ctx.companies.find(c => String(c.id) === String(draft.companyId));
+  return { type: 'create_intervention', companyId: company?.id || draft.companyId, companyName: company?.nome || draft.companyName, services: draft.services.map(s => { const svc = ctx.services.find(p => String(p.id) === String(s.serviceId)); return { id: svc?.id || s.serviceId, name: svc?.nome || s.serviceName, qty: Math.max(1, num(s.qty, 1)), price: num(svc?.price, 0) }; }), date: draft.date || '', time: draft.time || '', session: draft.session || '', userId: draft.userId || ctx.currentUser?.id || '', userName: draft.userName || ctx.currentUser?.name || '', note: draft.note || '' };
+}
+function interventionDraftToReply(draft, ctx) {
+  const action = buildFinalInterventionAction(draft, ctx);
+  const lines = action.services.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', ');
+  return `Ho preparato l’intervento:\n- Azienda: ${action.companyName}\n- Prestazioni: ${lines}\n- Data/ora: ${action.date}${action.time ? ' ore ' + action.time : action.session ? ' sessione ' + action.session : ''}${action.note ? '\n- Note: ' + action.note : ''}\n\nVuoi salvarlo?`;
+}
+function resolveNextInterventionStep(draft, ctx) {
+  draft = normalizeDraft(draft);
+  if (!draft.services.length) draft.services = [{ rawText: draft.originalText || '', qty: 1, serviceId: null, serviceName: null, candidates: [] }];
+  for (let i=0; i<draft.services.length; i++) {
+    const svc = draft.services[i];
+    if (!svc.serviceId) {
+      svc.candidates = findServiceCandidates(svc.rawText, ctx.services, { max: 8 });
+      draft.currentServiceIndex = i;
+      const top = svc.candidates[0]; const second = svc.candidates[1];
+      if (top && top.score >= 98 && (!second || second.score < top.score - 18)) { svc.serviceId = top.id; svc.serviceName = top.name; continue; }
+      draft.awaiting = 'service_choice';
+      if (!svc.candidates.length) return wizardResult(`Non trovo nel listino una prestazione simile a “${svc.rawText}”.`, draft, ['Cerca meglio','Crea nuova prestazione','Annulla']);
+      return buildServiceChoiceReply(draft, svc);
+    }
+  }
+  if (!draft.companyId) {
+    if (draft.companyRaw) {
+      draft.companyCandidates = findCompanyCandidates(draft.companyRaw, ctx.companies, { ctx, max: 8 });
+      const top = draft.companyCandidates[0]; const second = draft.companyCandidates[1];
+      if (top && top.score >= 98 && (!second || second.score < top.score - 18)) { draft.companyId = top.id; draft.companyName = top.name; }
+      else { draft.awaiting = 'company_choice'; return draft.companyCandidates.length ? buildCompanyChoiceReply(draft) : wizardResult('Non ho trovato una corrispondenza sicura. Vuoi cercare meglio o creare una nuova azienda?', draft, ['Cerca meglio','Crea nuova azienda','Aziende recenti','Annulla']); }
+    } else { draft.awaiting = 'company_choice'; return wizardResult('Per quale azienda?', draft, ['Cerca azienda','Aziende recenti','Annulla']); }
+  }
+  if (!draft.date || (!draft.time && !draft.session)) { draft.awaiting = 'datetime_choice'; return buildDateTimeChoiceReply(draft); }
+  const action = buildFinalInterventionAction(draft, ctx);
+  const valid = validateInterventionAction(action, ctx);
+  if (!valid.ok) { draft.awaiting = 'datetime_choice'; return wizardResult('Mi manca un dato: ' + valid.reason + '.', draft, ['ADESSO','oggi 14:30','Annulla']); }
+  draft.awaiting = 'confirm';
+  return { reply: interventionDraftToReply(draft, ctx), action, quickReplies: ['SALVA','Modifica prestazione','Modifica azienda','Modifica data/ora','Annulla'], ui: { mode: 'intervention_wizard', awaiting: 'confirm', draftId: draft.draftId, safeToApply: true }, clearDraft: false };
+}
+function continuePendingInterventionDraft(text, pendingDraft, ctx) {
+  let draft = normalizeDraft(pendingDraft);
+  if (!draft) return null;
+  const n = norm(text);
+  if (/^annulla$/.test(n)) return { reply: 'Ok, bozza intervento annullata.', action: null, quickReplies: [], ui: { mode: 'intervention_wizard', awaiting: null, draftId: draft.draftId, safeToApply: false }, clearDraft: true };
+  if (draft.awaiting === 'service_choice') {
+    const svc = draft.services[draft.currentServiceIndex || 0];
+    let choice = asArray(svc.candidates).find(c => norm(c.label) === n || norm(c.name) === n || n.includes(norm(c.name)) || norm(c.name).includes(n));
+    if (!choice) {
+      svc.rawText = text; svc.candidates = findServiceCandidates(text, ctx.services, { max: 8 });
+      draft.awaiting = 'service_choice'; return buildServiceChoiceReply(draft, svc);
+    }
+    svc.serviceId = choice.id; svc.serviceName = choice.name; return resolveNextInterventionStep(draft, ctx);
+  }
+  if (draft.awaiting === 'company_choice') {
+    let choice = asArray(draft.companyCandidates).find(c => norm(c.label) === n || norm(c.name) === n || n.includes(norm(c.name)) || norm(c.name).includes(n));
+    if (!choice) {
+      draft.companyRaw = text; draft.companyCandidates = findCompanyCandidates(text, ctx.companies, { ctx, max: 8 });
+      draft.awaiting = 'company_choice'; return draft.companyCandidates.length ? buildCompanyChoiceReply(draft) : wizardResult('Non ho trovato una corrispondenza sicura. Intendevi una di queste?', draft, ['Cerca meglio','Crea nuova azienda','Aziende recenti','Annulla']);
+    }
+    draft.companyId = choice.id; draft.companyName = choice.name; return resolveNextInterventionStep(draft, ctx);
+  }
+  if (draft.awaiting === 'datetime_choice') {
+    const now = ctx.now || new Date();
+    if (/^adesso$|^ora$|^subito$/.test(n)) { draft.date = isoDate(now); draft.time = `${pad2(now.getHours())}:${pad2(now.getMinutes())}`; draft.session = sessionFromText('', draft.time); }
+    else if (/solo mattina|mattina/.test(n)) { draft.date = draft.date || isoDate(now); draft.session = 'm'; }
+    else if (/solo pomeriggio|pomeriggio/.test(n)) { draft.date = draft.date || isoDate(now); draft.session = 'p'; }
+    else { const when = parseWhen(text, now); if (when.date) draft.date = when.date; if (when.time) draft.time = when.time; if (when.session) draft.session = when.session; }
+    return resolveNextInterventionStep(draft, ctx);
+  }
+  if (draft.awaiting === 'confirm') {
+    if (/^modifica prestazione/.test(n)) { for (const s of draft.services) { s.serviceId = null; s.serviceName = null; } draft.currentServiceIndex = 0; return resolveNextInterventionStep(draft, ctx); }
+    if (/^modifica azienda/.test(n)) { draft.companyId = null; draft.companyName = null; draft.companyRaw = ''; draft.companyCandidates = []; draft.awaiting = 'company_choice'; return wizardResult('Per quale azienda?', draft, ['Cerca azienda','Annulla']); }
+    if (/^modifica data|^modifica ora/.test(n)) { draft.date = null; draft.time = null; draft.session = null; return resolveNextInterventionStep(draft, ctx); }
+    if (/^salva|^conferma|^si$|^sì$|^ok$/.test(n)) { const action = buildFinalInterventionAction(draft, ctx); const valid = validateInterventionAction(action, ctx); return valid.ok ? { reply: 'Intervento pronto da salvare.', action, quickReplies: ['SALVA'], ui: { mode: 'intervention_wizard', awaiting: 'confirm', draftId: draft.draftId, safeToApply: true }, clearDraft: false } : wizardResult('Non salvo: ' + valid.reason + '.', draft, ['Modifica prestazione','Modifica azienda','Modifica data/ora','Annulla']); }
+  }
+  return resolveNextInterventionStep(draft, ctx);
+}
+function parseInterventionDraft(text, ctx) { return draftFromText(text, ctx); }
+function createInterventionWizardRequest(text, ctx) {
+  const pending = normalizeDraft(ctx.raw?.pendingInterventionDraft || ctx.raw?.pending_intervention_draft);
+  if (pending) return continuePendingInterventionDraft(text, pending, ctx);
+  if (!isCreateInterventionIntent(text, ctx)) return null;
+  return resolveNextInterventionStep(draftFromText(text, ctx), ctx);
+}
+
 
 function requestedFields(text) {
   const n = norm(text);
@@ -994,243 +1292,6 @@ function learnQuery(text, ctx) {
   if (!content) return { reply: 'Cosa devo ricordare?', action: null, actions: [], learn: [] };
   return { reply: 'Ok, lo salvo nella memoria AI.', action: null, actions: [], learn: [{ kind: 'istruzione', text: content, userId: ctx.currentUser?.id || '', userName: ctx.currentUser?.name || '' }] };
 }
-
-function aiUi(mode = 'none', awaiting = null, draft = null, safeToApply = false) {
-  return { mode, awaiting, draftId: draft?.draftId || '', safeToApply: !!safeToApply };
-}
-function guidedResponse(reply, action = null, quickReplies = [], ui = null) {
-  return { reply, action, actions: [], learn: [], quickReplies: quickReplies.slice(0, 8), ui: ui || aiUi() };
-}
-function draftAction(draft) {
-  return { type: 'continue_intervention_draft', draft, awaiting: draft.awaiting };
-}
-function candidateButtonLabel(item, kind) {
-  if (kind === 'company') return [item.nome, item.comune || item.provincia || item.addr].filter(Boolean).join(' · ').slice(0, 64);
-  return safeText(item.nome || item.name, 64);
-}
-function wordQty(w) {
-  const n = norm(w);
-  if (/^\d+$/.test(n)) return Number(n);
-  if (NUMBER_WORDS.has(n)) return NUMBER_WORDS.get(n);
-  if (n === 'doppia') return 2;
-  if (n === 'tripla') return 3;
-  return 1;
-}
-function serviceSynonymText(text) {
-  let n = canonicalServiceText(text);
-  n = n.replace(/\bfa\b/g, ' fecondazione inseminazione ');
-  n = n.replace(/\bseme\b|\bsessat[oa]\b/g, ' seme sessato fecondazione inseminazione ');
-  n = n.replace(/\bgravidanz[ae]\b|\bgravide\b/g, ' gravidanza ecografia diagnosi ');
-  n = n.replace(/\bpost parto\b|\bpuerperi[oa]\b/g, ' post parto puerperio metrite visita controllo ');
-  n = n.replace(/\bflebo\b|\bendovena\b/g, ' terapia endovenosa flebo ');
-  n = n.replace(/\bpodal[ei]\b|\bzoppi[ae]\b/g, ' podale pareggio zoppia ');
-  n = n.replace(/\bparto\b/g, ' parto assistenza ');
-  return n;
-}
-function scoreServiceCandidate(raw, svc) {
-  const q = serviceSynonymText(raw);
-  const t = serviceSynonymText([svc.nome, svc.cat, svc.tipo].filter(Boolean).join(' '));
-  let score = tokenScore(q, t, { strong: true });
-  const qTokens = meaningfulTokens(q);
-  const tTokens = meaningfulTokens(t);
-  const hits = qTokens.filter(qt => tTokens.some(tt => tt === qt || tt.startsWith(qt) || qt.startsWith(tt))).length;
-  return score + hits * 6 + (norm(svc.nome) === norm(raw) ? 80 : 0);
-}
-
-function findServiceCandidates(rawServiceText, services, { limit = 8 } = {}) {
-  const raw = safeText(rawServiceText, 260);
-  if (!raw) return [];
-  return services.map(s => ({ item: s, score: scoreServiceCandidate(raw, s) }))
-    .filter(x => x.score >= 24)
-    .sort((a,b) => b.score - a.score || String(a.item.nome).localeCompare(String(b.item.nome), 'it'))
-    .slice(0, limit)
-    .map(x => ({ ...x.item, score: x.score }));
-}
-function scoreCompanyCandidate(raw, c) {
-  const fields = [c.nome, c.ragioneSociale, c.comune, c.provincia, c.addr, c.piva, c.cf, c.sdi].filter(Boolean);
-  return Math.max(0, ...fields.map((f, idx) => tokenScore(raw, f, { strong: idx < 2 }) - (idx > 3 ? 8 : 0)));
-}
-function findCompanyCandidates(rawCompanyText, companies, { limit = 8 } = {}) {
-  const raw = safeText(rawCompanyText, 260);
-  if (!raw) return [];
-  return companies.map(c => ({ item: c, score: scoreCompanyCandidate(raw, c) }))
-    .filter(x => x.score >= 18)
-    .sort((a,b) => b.score - a.score || String(a.item.nome).localeCompare(String(b.item.nome), 'it'))
-    .slice(0, limit)
-    .map(x => ({ ...x.item, score: x.score }));
-}
-function extractCompanyRaw(text) {
-  const raw = safeText(text, 1000);
-  const m = raw.match(/\b(?:da|presso|cliente|azienda)\s+(.+?)(?:\s+(?:oggi|ieri|domani|alle|ore|mattina|pomeriggio|sera|notte|con|nota|vacca|manza)\b|$)/i);
-  if (m) return safeText(m[1].replace(/[,.]+$/,''), 180).trim();
-  return '';
-}
-function stripKnownWhenCompany(text) {
-  return safeText(text, 1000)
-    .replace(/\b(?:da|presso|cliente|azienda)\s+.+?(?=\s+(?:oggi|ieri|domani|alle|ore|mattina|pomeriggio|sera|notte|con|nota|vacca|manza)\b|$)/ig, ' ')
-    .replace(/\b(oggi|ieri|domani|adesso|ora|stamattina|mattina|pomeriggio|sera|notte)\b/ig, ' ')
-    .replace(/\b(?:alle|ore)\s*\d{1,2}(?::|\.)?\d{0,2}\b/ig, ' ')
-    .replace(/\b\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?\b/g, ' ')
-    .trim();
-}
-function extractRawServices(text, ctx) {
-  let raw = stripKnownWhenCompany(text);
-  raw = raw.replace(/\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|intervento|prestazione|prestazioni)\b/ig, ' ');
-  raw = raw.replace(/\b(vacca|manza|bovina?)\s+\d+.*$/i, ' ');
-  const parts = raw.split(/[,;+]|\s+(?:e|piu|più|con)\s+/i).map(x => x.trim()).filter(x => x.length > 1);
-  const out = [];
-  for (const part of parts.length ? parts : [raw]) {
-    const m = part.match(/\b(\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|doppia|tripla|x\d+)\s+(.+)$/i);
-    let qty = 1, name = part;
-    if (m) { qty = String(m[1]).toLowerCase().startsWith('x') ? Number(String(m[1]).slice(1)) : wordQty(m[1]); name = m[2]; }
-    const serviceHint = serviceTextFromRequest(name) || name;
-    if (norm(serviceHint)) out.push({ rawText: safeText(serviceHint, 180), qty: Math.max(1, qty || 1), serviceId: null, serviceName: null, alternatives: [] });
-  }
-  return out.slice(0, 8);
-}
-function extractDraftNote(text) {
-  const raw = safeText(text, 1000);
-  const m = raw.match(/\b(vacca|manza|vitello|animale|nota|note|quarto|parto difficile|controllare|richiamare|urgenza)\b(.+)?$/i);
-  return m ? safeText(raw.slice(m.index), 500) : '';
-}
-function parseInterventionDraft(text, ctx) {
-  const when = parseWhen(text, ctx.now);
-  const companyRaw = extractCompanyRaw(text);
-  const services = extractRawServices(text, ctx);
-  const draft = {
-    type: 'intervention_draft', draftId: 'draft_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7), originalText: safeText(text, 1000),
-    company: null, companyRaw, companyAlternatives: [], services,
-    date: when.date || null, time: when.time || null, session: when.session || null,
-    userId: ctx.currentUser?.id || null, userName: ctx.currentUser?.name || null,
-    note: extractDraftNote(text), awaiting: null, missing: []
-  };
-  for (const svc of draft.services) {
-    const cands = findServiceCandidates(svc.rawText, ctx.services, { limit: 8 });
-    svc.alternatives = cands.map(s => ({ id: s.id, nome: s.nome, name: s.nome, price: s.price, score: s.score }));
-    if (cands.length === 1 || (cands[0] && cands[0].score >= 100 && (!cands[1] || cands[1].score < cands[0].score - 22))) {
-      svc.serviceId = cands[0].id; svc.serviceName = cands[0].nome; svc.price = cands[0].price;
-    }
-  }
-  if (companyRaw) {
-    const cands = findCompanyCandidates(companyRaw, ctx.companies, { limit: 8 });
-    draft.companyAlternatives = cands.map(c => ({ id: c.id, nome: c.nome, ragioneSociale: c.ragioneSociale, comune: c.comune, provincia: c.provincia, addr: c.addr, score: c.score }));
-    if (cands.length === 1 || (cands[0] && cands[0].score >= 90 && (!cands[1] || cands[1].score < cands[0].score - 18))) draft.company = { id: cands[0].id, nome: cands[0].nome, comune: cands[0].comune, provincia: cands[0].provincia };
-  }
-  return resolveNextInterventionStep(draft, ctx);
-}
-function unresolvedService(draft) { return (draft.services || []).find(s => !s.serviceId); }
-function buildServiceChoiceReply(draft, unresolved) {
-  const labels = (unresolved.alternatives || []).map(s => s.nome || s.name).filter(Boolean);
-  const buttons = [...labels, 'Cerca meglio', 'Annulla'].slice(0, 8);
-  return guidedResponse(`Quale prestazione vuoi inserire per “${unresolved.rawText}”?`, draftAction(draft), buttons, aiUi('intervention_wizard', 'service_choice', draft, false));
-}
-function buildCompanyChoiceReply(draft) {
-  const labels = (draft.companyAlternatives || []).map(c => candidateButtonLabel(c, 'company')).filter(Boolean);
-  const buttons = labels.length ? [...labels, 'Cerca meglio', 'Annulla'].slice(0, 8) : ['Cerca azienda', 'Crea nuova azienda', 'Annulla'];
-  const name = draft.companyRaw ? ` ${draft.companyRaw}` : '';
-  return guidedResponse(labels.length ? `Quale azienda${name} intendi?` : 'Per quale azienda?', draftAction(draft), buttons, aiUi('intervention_wizard', 'company_choice', draft, false));
-}
-function buildDateTimeChoiceReply(draft) {
-  return guidedResponse('Quando lo registro?', draftAction(draft), ['ADESSO','oggi 14:30','ieri 09:00','Solo mattina','Solo pomeriggio','Annulla'], aiUi('intervention_wizard', 'datetime_choice', draft, false));
-}
-function isInterventionReady(draft) {
-  return !!(draft?.company?.id && (draft.services || []).length && !(draft.services || []).some(s => !s.serviceId) && draft.date && (draft.time || draft.session) && draft.userId);
-}
-function buildFinalInterventionAction(draft, ctx) {
-  return { type: 'create_intervention', companyId: draft.company.id, companyName: draft.company.nome, services: (draft.services || []).map(s => ({ id: s.serviceId, name: s.serviceName, qty: Math.max(1, num(s.qty, 1)), price: num(s.price, 0) })), date: draft.date, time: draft.time || '', session: draft.session || sessionFromText('', draft.time || ''), userId: draft.userId || ctx.currentUser?.id || '', userName: draft.userName || ctx.currentUser?.name || '', note: safeText(draft.note || 'Preparato da Rural Vet AI', 600) };
-}
-function validateInterventionAction(action, ctx) {
-  const errors = [];
-  if (!action || action.type !== 'create_intervention') return { ok: false, errors: ['azione non valida'] };
-  if (!action.companyId || !ctx.companies.some(c => String(c.id) === String(action.companyId))) errors.push('azienda');
-  if (!Array.isArray(action.services) || !action.services.length) errors.push('prestazioni');
-  for (const s of action.services || []) {
-    if (!s.id || !ctx.services.some(p => String(p.id) === String(s.id))) errors.push('prestazione ' + (s.name || ''));
-    if (num(s.qty, 0) < 1) errors.push('quantita');
-  }
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(action.date || ''))) errors.push('data');
-  if (!action.time && !action.session) errors.push('ora/sessione');
-  return { ok: !errors.length, errors: [...new Set(errors)] };
-}
-function interventionDraftToReply(draft, ctx) {
-  const action = buildFinalInterventionAction(draft, ctx);
-  const val = validateInterventionAction(action, ctx);
-  if (!val.ok) return guidedResponse('Mi manca: ' + val.errors.join(', ') + '.', draftAction(draft), ['Annulla'], aiUi('intervention_wizard', draft.awaiting, draft, false));
-  const total = action.services.reduce((s, x) => s + num(x.price, 0) * num(x.qty, 1), 0);
-  const lines = [
-    'Ho preparato l’intervento:',
-    '- Azienda: ' + action.companyName,
-    '- Prestazioni: ' + action.services.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', '),
-    '- Data/ora: ' + action.date + (action.time ? ' ' + action.time : ' ' + action.session),
-    total ? '- Totale stimato: ' + euro(total) : '',
-    'Vuoi salvarlo?'
-  ].filter(Boolean).join('\n');
-  draft.awaiting = 'confirm';
-  return guidedResponse(lines, action, ['SALVA','Modifica prestazione','Modifica azienda','Modifica data/ora','Aggiungi nota','Annulla'], aiUi('intervention_wizard', 'confirm', draft, true));
-}
-function resolveNextInterventionStep(draft, ctx) {
-  const u = unresolvedService(draft);
-  if (u) { draft.awaiting = 'service_choice'; return buildServiceChoiceReply(draft, u); }
-  if (!draft.company?.id) { draft.awaiting = 'company_choice'; return buildCompanyChoiceReply(draft); }
-  if (!draft.date || (!draft.time && !draft.session)) { draft.awaiting = 'datetime_choice'; return buildDateTimeChoiceReply(draft); }
-  return interventionDraftToReply(draft, ctx);
-}
-function selectByButtonLabel(label, alternatives, kind) {
-  const n = norm(label).replace(/\s+(pc|pr|cr|lo|rm|mi|pv|mn|bs|bg)$/,'').trim();
-  return (alternatives || []).find(x => norm(candidateButtonLabel(x, kind)) === n || norm(x.nome || x.name) === n || norm(candidateButtonLabel(x, kind)).startsWith(n) || n.startsWith(norm(x.nome || x.name)));
-}
-function continuePendingInterventionDraft(userText, pendingDraft, ctx) {
-  const text = safeText(userText, 1000);
-  const n = norm(text);
-  const draft = JSON.parse(JSON.stringify(pendingDraft || {}));
-  if (!draft || draft.type !== 'intervention_draft') return null;
-  if (/^(annulla|cancella|reset|stop)$/.test(n)) return guidedResponse('Ok, ho annullato la bozza intervento.', null, [], aiUi('none', null, null, false));
-  if (/modifica prestazione/.test(n)) { const first = (draft.services || [])[0]; if (first) { first.serviceId = null; first.serviceName = null; } return resolveNextInterventionStep(draft, ctx); }
-  if (/modifica azienda/.test(n)) { draft.company = null; draft.companyRaw = ''; draft.companyAlternatives = []; return buildCompanyChoiceReply(draft); }
-  if (/modifica data|modifica ora/.test(n)) { draft.date = null; draft.time = null; draft.session = null; return buildDateTimeChoiceReply(draft); }
-  if (/aggiungi nota/.test(n)) { draft.awaiting = 'note_choice'; return guidedResponse('Che nota aggiungo?', draftAction(draft), ['Annulla'], aiUi('intervention_wizard','note_choice',draft,false)); }
-  if (draft.awaiting === 'note_choice') { draft.note = [draft.note, text].filter(Boolean).join(' | '); return resolveNextInterventionStep(draft, ctx); }
-  if (/aggiungi un altra|aggiungi un'altra|altra prestazione/.test(n)) { draft.services.push({ rawText: '', qty: 1, serviceId: null, serviceName: null, alternatives: [] }); draft.awaiting = 'service_choice'; return guidedResponse('Che prestazione aggiungo?', draftAction(draft), ['Annulla'], aiUi('intervention_wizard','service_choice',draft,false)); }
-  if (draft.awaiting === 'service_choice') {
-    let target = unresolvedService(draft) || (draft.services || [])[0];
-    let chosen = selectByButtonLabel(text, target?.alternatives || [], 'service');
-    if (!chosen) {
-      const cands = findServiceCandidates(text, ctx.services, { limit: 8 });
-      if (target) target.alternatives = cands.map(s => ({ id:s.id, nome:s.nome, name:s.nome, price:s.price, score:s.score }));
-      if (cands.length === 1) chosen = cands[0];
-      else if (target) return buildServiceChoiceReply(draft, target);
-    }
-    if (target && chosen) { target.serviceId = chosen.id; target.serviceName = chosen.nome || chosen.name; target.price = chosen.price; }
-    return resolveNextInterventionStep(draft, ctx);
-  }
-  if (draft.awaiting === 'company_choice') {
-    let chosen = selectByButtonLabel(text, draft.companyAlternatives || [], 'company');
-    if (!chosen) {
-      const cands = findCompanyCandidates(text, ctx.companies, { limit: 8 });
-      draft.companyRaw = text;
-      draft.companyAlternatives = cands.map(c => ({ id:c.id, nome:c.nome, ragioneSociale:c.ragioneSociale, comune:c.comune, provincia:c.provincia, addr:c.addr, score:c.score }));
-      if (cands.length === 1) chosen = cands[0];
-      else return buildCompanyChoiceReply(draft);
-    }
-    draft.company = { id: chosen.id, nome: chosen.nome, comune: chosen.comune, provincia: chosen.provincia };
-    return resolveNextInterventionStep(draft, ctx);
-  }
-  if (draft.awaiting === 'datetime_choice') {
-    const when = parseWhen(text, ctx.now);
-    if (/solo mattina/.test(n)) { draft.date = draft.date || isoDate(ctx.now); draft.session = 'm'; }
-    else if (/solo pomeriggio/.test(n)) { draft.date = draft.date || isoDate(ctx.now); draft.session = 'p'; }
-    else { draft.date = when.date || draft.date; draft.time = when.time || draft.time; draft.session = when.session || draft.session; }
-    return resolveNextInterventionStep(draft, ctx);
-  }
-  return resolveNextInterventionStep(draft, ctx);
-}
-function isInterventionDraftStart(text, ctx) {
-  const n = norm(text);
-  if (/\b(prezzo|quanto costa|listino|piva|fattura|fatture|ricavi|top|dashboard)\b/.test(n)) return false;
-  if (isCreateInterventionRequest(text)) return true;
-  if (/\b(\d+|un|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\s+\w+/.test(n) && extractRawServices(text, ctx).length) return true;
-  return false;
-}
 function buildCreateClientAction(text) {
   const raw = safeText(text, 4000);
   const after = raw.replace(/^.*?(?:crea|aggiungi|nuovo|inserisci)\s+(?:cliente|azienda)\s*/i, '').trim();
@@ -1258,11 +1319,9 @@ function createClientRequest(text, ctx) {
   return { reply: `Ho preparato il nuovo cliente: ${action.name}.\nRagione sociale: ${action.ragioneSociale || '-'}\nIndirizzo: ${[action.address, action.cap, action.comune, action.provincia].filter(Boolean).join(', ')}\nConfermi la creazione?`, action, actions: [], learn: [] };
 }
 function createInterventionRequest(text, ctx) {
-  if (!isInterventionDraftStart(text, ctx)) return null;
-  const pending = ctx.raw?.pendingInterventionDraft;
-  if (pending && pending.type === 'intervention_draft') return continuePendingInterventionDraft(text, pending, ctx);
-  return parseInterventionDraft(text, ctx);
+  return createInterventionWizardRequest(text, ctx);
 }
+
 function deleteInterventionRequest(text, ctx) {
   if (!isDeleteRequest(text)) return null;
   const filters = managementFilters(text, ctx, /\boggi\b/.test(norm(text)) ? 'today' : 'ytd');
@@ -1272,8 +1331,7 @@ function deleteInterventionRequest(text, ctx) {
   return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
 }
 function deterministicRouter(text, ctx) {
-  if (ctx.raw?.pendingInterventionDraft?.type === 'intervention_draft') return continuePendingInterventionDraft(text, ctx.raw.pendingInterventionDraft, ctx);
-  const handlers = [managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
+  const handlers = [createInterventionRequest, managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
   for (const h of handlers) {
     const ans = h(text, ctx);
     if (ans) return ans;
@@ -1368,28 +1426,22 @@ async function generalAnswer(body, ctx) {
 }
 function validateAction(result, ctx) {
   if (!result) return result;
-  if (!result.ui) result.ui = aiUi();
   const all = [];
   if (result.action) all.push(result.action);
   if (Array.isArray(result.actions)) all.push(...result.actions);
-  let safe = !!result.ui.safeToApply;
   for (const a of all) {
-    if (!a || typeof a !== 'object') { safe = false; continue; }
+    if (!a || typeof a !== 'object') continue;
     if (a.type === 'create_intervention') {
-      const v = validateInterventionAction(a, ctx);
-      if (!v.ok) {
-        safe = false;
-        result.quickReplies = (result.quickReplies || []).filter(q => String(q).toUpperCase() !== 'SALVA');
-        result.reply = result.reply || ('Non salvo ancora: mi manca ' + v.errors.join(', ') + '.');
+      if (a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) a.companyId = '';
+      if (Array.isArray(a.services)) {
+        for (const s of a.services) if (s.id && !ctx.services.some(p => String(p.id) === String(s.id))) s.id = '';
       }
     }
-    if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) { a.interventionId = ''; safe = false; }
-    if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) { a.companyId = ''; safe = false; }
-    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) { a.serviceId = ''; safe = false; }
-    if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) { a.invoiceId = ''; safe = false; }
+    if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) a.interventionId = '';
+    if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) a.companyId = '';
+    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) a.serviceId = '';
+    if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) a.invoiceId = '';
   }
-  if (result.ui.mode === 'intervention_wizard' && result.ui.awaiting !== 'confirm') safe = false;
-  result.ui.safeToApply = safe;
   return result;
 }
 
@@ -1430,8 +1482,7 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     }
 
     result = validateAction(result, ctx);
-    if (String(process.env.AI_DEBUG || '').toLowerCase() === 'true') console.log('[AI_DEBUG]', JSON.stringify({ input:text, source, awaiting:result.ui?.awaiting || null, draftId:result.ui?.draftId || '', actionType:result.action?.type || '', safeToApply:!!result.ui?.safeToApply, counts:{companies:ctx.companies.length, services:ctx.services.length} }));
-    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || aiUi(), source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
+    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || null, clearDraft: !!result.clearDraft, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
     res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
@@ -1443,6 +1494,9 @@ app.post(['/api/ai', '/api/chat'], (req, res, next) => {
   app._router.handle(req, res, next);
 });
 
-if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
+if (process.argv[1] && import.meta.url.endsWith('/' + process.argv[1].split('/').pop())) {
+  app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
+}
 
-export { buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates };
+export { buildContext, findCompanyCandidates, findServiceCandidates, parseInterventionDraft, continuePendingInterventionDraft, resolveNextInterventionStep, validateInterventionAction, createInterventionWizardRequest };
+
