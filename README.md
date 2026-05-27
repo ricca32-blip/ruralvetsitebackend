@@ -195,3 +195,50 @@ Endpoint chat usato dal frontend:
 ## Nota importante
 
 L'obiettivo di questa versione e coprire il piu possibile le modifiche umane del gestionale tramite chat. Per sicurezza, le azioni che cambiano dati vengono sempre trasformate in una proposta strutturata e applicate solo dopo `SALVA` o `ELIMINA`.
+
+## Stabilizzazione Rural Vet AI
+
+Questa versione aggiunge una fase di sicurezza per il flusso AI di inserimento interventi.
+
+### Contratto backend/frontend
+
+Le risposte AI possono includere anche:
+
+```json
+{
+  "ui": {
+    "mode": "intervention_wizard",
+    "awaiting": "service_choice|company_choice|datetime_choice|note_choice|confirm",
+    "draftId": "...",
+    "safeToApply": false
+  }
+}
+```
+
+Regole operative:
+
+- `safeToApply` diventa `true` solo quando l'intervento ha azienda reale, prestazioni reali, quantità, data e ora/sessione.
+- I click sui bottoni continuano la `pendingInterventionDraft`, invece di essere interpretati come nuove richieste.
+- `SALVA` applica solo azioni complete.
+- `Annulla` cancella bozza e pending action.
+
+### Debug opzionale
+
+Per vedere il percorso decisionale del backend senza mostrarlo all'utente:
+
+```txt
+AI_DEBUG=true
+```
+
+Il backend logga intent, step della bozza, action type e stato `safeToApply`.
+
+### Test prima del deploy
+
+Prima di caricare su Render o sostituire i file in produzione, eseguire:
+
+```bash
+node --check server.js
+node test-ai-flow.js
+```
+
+`test-ai-flow.js` verifica sintassi backend, sintassi script frontend e presenza del contratto della bozza intervento.

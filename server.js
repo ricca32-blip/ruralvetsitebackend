@@ -994,6 +994,243 @@ function learnQuery(text, ctx) {
   if (!content) return { reply: 'Cosa devo ricordare?', action: null, actions: [], learn: [] };
   return { reply: 'Ok, lo salvo nella memoria AI.', action: null, actions: [], learn: [{ kind: 'istruzione', text: content, userId: ctx.currentUser?.id || '', userName: ctx.currentUser?.name || '' }] };
 }
+
+function aiUi(mode = 'none', awaiting = null, draft = null, safeToApply = false) {
+  return { mode, awaiting, draftId: draft?.draftId || '', safeToApply: !!safeToApply };
+}
+function guidedResponse(reply, action = null, quickReplies = [], ui = null) {
+  return { reply, action, actions: [], learn: [], quickReplies: quickReplies.slice(0, 8), ui: ui || aiUi() };
+}
+function draftAction(draft) {
+  return { type: 'continue_intervention_draft', draft, awaiting: draft.awaiting };
+}
+function candidateButtonLabel(item, kind) {
+  if (kind === 'company') return [item.nome, item.comune || item.provincia || item.addr].filter(Boolean).join(' · ').slice(0, 64);
+  return safeText(item.nome || item.name, 64);
+}
+function wordQty(w) {
+  const n = norm(w);
+  if (/^\d+$/.test(n)) return Number(n);
+  if (NUMBER_WORDS.has(n)) return NUMBER_WORDS.get(n);
+  if (n === 'doppia') return 2;
+  if (n === 'tripla') return 3;
+  return 1;
+}
+function serviceSynonymText(text) {
+  let n = canonicalServiceText(text);
+  n = n.replace(/\bfa\b/g, ' fecondazione inseminazione ');
+  n = n.replace(/\bseme\b|\bsessat[oa]\b/g, ' seme sessato fecondazione inseminazione ');
+  n = n.replace(/\bgravidanz[ae]\b|\bgravide\b/g, ' gravidanza ecografia diagnosi ');
+  n = n.replace(/\bpost parto\b|\bpuerperi[oa]\b/g, ' post parto puerperio metrite visita controllo ');
+  n = n.replace(/\bflebo\b|\bendovena\b/g, ' terapia endovenosa flebo ');
+  n = n.replace(/\bpodal[ei]\b|\bzoppi[ae]\b/g, ' podale pareggio zoppia ');
+  n = n.replace(/\bparto\b/g, ' parto assistenza ');
+  return n;
+}
+function scoreServiceCandidate(raw, svc) {
+  const q = serviceSynonymText(raw);
+  const t = serviceSynonymText([svc.nome, svc.cat, svc.tipo].filter(Boolean).join(' '));
+  let score = tokenScore(q, t, { strong: true });
+  const qTokens = meaningfulTokens(q);
+  const tTokens = meaningfulTokens(t);
+  const hits = qTokens.filter(qt => tTokens.some(tt => tt === qt || tt.startsWith(qt) || qt.startsWith(tt))).length;
+  return score + hits * 6 + (norm(svc.nome) === norm(raw) ? 80 : 0);
+}
+
+function findServiceCandidates(rawServiceText, services, { limit = 8 } = {}) {
+  const raw = safeText(rawServiceText, 260);
+  if (!raw) return [];
+  return services.map(s => ({ item: s, score: scoreServiceCandidate(raw, s) }))
+    .filter(x => x.score >= 24)
+    .sort((a,b) => b.score - a.score || String(a.item.nome).localeCompare(String(b.item.nome), 'it'))
+    .slice(0, limit)
+    .map(x => ({ ...x.item, score: x.score }));
+}
+function scoreCompanyCandidate(raw, c) {
+  const fields = [c.nome, c.ragioneSociale, c.comune, c.provincia, c.addr, c.piva, c.cf, c.sdi].filter(Boolean);
+  return Math.max(0, ...fields.map((f, idx) => tokenScore(raw, f, { strong: idx < 2 }) - (idx > 3 ? 8 : 0)));
+}
+function findCompanyCandidates(rawCompanyText, companies, { limit = 8 } = {}) {
+  const raw = safeText(rawCompanyText, 260);
+  if (!raw) return [];
+  return companies.map(c => ({ item: c, score: scoreCompanyCandidate(raw, c) }))
+    .filter(x => x.score >= 18)
+    .sort((a,b) => b.score - a.score || String(a.item.nome).localeCompare(String(b.item.nome), 'it'))
+    .slice(0, limit)
+    .map(x => ({ ...x.item, score: x.score }));
+}
+function extractCompanyRaw(text) {
+  const raw = safeText(text, 1000);
+  const m = raw.match(/\b(?:da|presso|cliente|azienda)\s+(.+?)(?:\s+(?:oggi|ieri|domani|alle|ore|mattina|pomeriggio|sera|notte|con|nota|vacca|manza)\b|$)/i);
+  if (m) return safeText(m[1].replace(/[,.]+$/,''), 180).trim();
+  return '';
+}
+function stripKnownWhenCompany(text) {
+  return safeText(text, 1000)
+    .replace(/\b(?:da|presso|cliente|azienda)\s+.+?(?=\s+(?:oggi|ieri|domani|alle|ore|mattina|pomeriggio|sera|notte|con|nota|vacca|manza)\b|$)/ig, ' ')
+    .replace(/\b(oggi|ieri|domani|adesso|ora|stamattina|mattina|pomeriggio|sera|notte)\b/ig, ' ')
+    .replace(/\b(?:alle|ore)\s*\d{1,2}(?::|\.)?\d{0,2}\b/ig, ' ')
+    .replace(/\b\d{1,2}[\/.-]\d{1,2}(?:[\/.-]\d{2,4})?\b/g, ' ')
+    .trim();
+}
+function extractRawServices(text, ctx) {
+  let raw = stripKnownWhenCompany(text);
+  raw = raw.replace(/\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|intervento|prestazione|prestazioni)\b/ig, ' ');
+  raw = raw.replace(/\b(vacca|manza|bovina?)\s+\d+.*$/i, ' ');
+  const parts = raw.split(/[,;+]|\s+(?:e|piu|più|con)\s+/i).map(x => x.trim()).filter(x => x.length > 1);
+  const out = [];
+  for (const part of parts.length ? parts : [raw]) {
+    const m = part.match(/\b(\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|doppia|tripla|x\d+)\s+(.+)$/i);
+    let qty = 1, name = part;
+    if (m) { qty = String(m[1]).toLowerCase().startsWith('x') ? Number(String(m[1]).slice(1)) : wordQty(m[1]); name = m[2]; }
+    const serviceHint = serviceTextFromRequest(name) || name;
+    if (norm(serviceHint)) out.push({ rawText: safeText(serviceHint, 180), qty: Math.max(1, qty || 1), serviceId: null, serviceName: null, alternatives: [] });
+  }
+  return out.slice(0, 8);
+}
+function extractDraftNote(text) {
+  const raw = safeText(text, 1000);
+  const m = raw.match(/\b(vacca|manza|vitello|animale|nota|note|quarto|parto difficile|controllare|richiamare|urgenza)\b(.+)?$/i);
+  return m ? safeText(raw.slice(m.index), 500) : '';
+}
+function parseInterventionDraft(text, ctx) {
+  const when = parseWhen(text, ctx.now);
+  const companyRaw = extractCompanyRaw(text);
+  const services = extractRawServices(text, ctx);
+  const draft = {
+    type: 'intervention_draft', draftId: 'draft_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7), originalText: safeText(text, 1000),
+    company: null, companyRaw, companyAlternatives: [], services,
+    date: when.date || null, time: when.time || null, session: when.session || null,
+    userId: ctx.currentUser?.id || null, userName: ctx.currentUser?.name || null,
+    note: extractDraftNote(text), awaiting: null, missing: []
+  };
+  for (const svc of draft.services) {
+    const cands = findServiceCandidates(svc.rawText, ctx.services, { limit: 8 });
+    svc.alternatives = cands.map(s => ({ id: s.id, nome: s.nome, name: s.nome, price: s.price, score: s.score }));
+    if (cands.length === 1 || (cands[0] && cands[0].score >= 100 && (!cands[1] || cands[1].score < cands[0].score - 22))) {
+      svc.serviceId = cands[0].id; svc.serviceName = cands[0].nome; svc.price = cands[0].price;
+    }
+  }
+  if (companyRaw) {
+    const cands = findCompanyCandidates(companyRaw, ctx.companies, { limit: 8 });
+    draft.companyAlternatives = cands.map(c => ({ id: c.id, nome: c.nome, ragioneSociale: c.ragioneSociale, comune: c.comune, provincia: c.provincia, addr: c.addr, score: c.score }));
+    if (cands.length === 1 || (cands[0] && cands[0].score >= 90 && (!cands[1] || cands[1].score < cands[0].score - 18))) draft.company = { id: cands[0].id, nome: cands[0].nome, comune: cands[0].comune, provincia: cands[0].provincia };
+  }
+  return resolveNextInterventionStep(draft, ctx);
+}
+function unresolvedService(draft) { return (draft.services || []).find(s => !s.serviceId); }
+function buildServiceChoiceReply(draft, unresolved) {
+  const labels = (unresolved.alternatives || []).map(s => s.nome || s.name).filter(Boolean);
+  const buttons = [...labels, 'Cerca meglio', 'Annulla'].slice(0, 8);
+  return guidedResponse(`Quale prestazione vuoi inserire per “${unresolved.rawText}”?`, draftAction(draft), buttons, aiUi('intervention_wizard', 'service_choice', draft, false));
+}
+function buildCompanyChoiceReply(draft) {
+  const labels = (draft.companyAlternatives || []).map(c => candidateButtonLabel(c, 'company')).filter(Boolean);
+  const buttons = labels.length ? [...labels, 'Cerca meglio', 'Annulla'].slice(0, 8) : ['Cerca azienda', 'Crea nuova azienda', 'Annulla'];
+  const name = draft.companyRaw ? ` ${draft.companyRaw}` : '';
+  return guidedResponse(labels.length ? `Quale azienda${name} intendi?` : 'Per quale azienda?', draftAction(draft), buttons, aiUi('intervention_wizard', 'company_choice', draft, false));
+}
+function buildDateTimeChoiceReply(draft) {
+  return guidedResponse('Quando lo registro?', draftAction(draft), ['ADESSO','oggi 14:30','ieri 09:00','Solo mattina','Solo pomeriggio','Annulla'], aiUi('intervention_wizard', 'datetime_choice', draft, false));
+}
+function isInterventionReady(draft) {
+  return !!(draft?.company?.id && (draft.services || []).length && !(draft.services || []).some(s => !s.serviceId) && draft.date && (draft.time || draft.session) && draft.userId);
+}
+function buildFinalInterventionAction(draft, ctx) {
+  return { type: 'create_intervention', companyId: draft.company.id, companyName: draft.company.nome, services: (draft.services || []).map(s => ({ id: s.serviceId, name: s.serviceName, qty: Math.max(1, num(s.qty, 1)), price: num(s.price, 0) })), date: draft.date, time: draft.time || '', session: draft.session || sessionFromText('', draft.time || ''), userId: draft.userId || ctx.currentUser?.id || '', userName: draft.userName || ctx.currentUser?.name || '', note: safeText(draft.note || 'Preparato da Rural Vet AI', 600) };
+}
+function validateInterventionAction(action, ctx) {
+  const errors = [];
+  if (!action || action.type !== 'create_intervention') return { ok: false, errors: ['azione non valida'] };
+  if (!action.companyId || !ctx.companies.some(c => String(c.id) === String(action.companyId))) errors.push('azienda');
+  if (!Array.isArray(action.services) || !action.services.length) errors.push('prestazioni');
+  for (const s of action.services || []) {
+    if (!s.id || !ctx.services.some(p => String(p.id) === String(s.id))) errors.push('prestazione ' + (s.name || ''));
+    if (num(s.qty, 0) < 1) errors.push('quantita');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(action.date || ''))) errors.push('data');
+  if (!action.time && !action.session) errors.push('ora/sessione');
+  return { ok: !errors.length, errors: [...new Set(errors)] };
+}
+function interventionDraftToReply(draft, ctx) {
+  const action = buildFinalInterventionAction(draft, ctx);
+  const val = validateInterventionAction(action, ctx);
+  if (!val.ok) return guidedResponse('Mi manca: ' + val.errors.join(', ') + '.', draftAction(draft), ['Annulla'], aiUi('intervention_wizard', draft.awaiting, draft, false));
+  const total = action.services.reduce((s, x) => s + num(x.price, 0) * num(x.qty, 1), 0);
+  const lines = [
+    'Ho preparato l’intervento:',
+    '- Azienda: ' + action.companyName,
+    '- Prestazioni: ' + action.services.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', '),
+    '- Data/ora: ' + action.date + (action.time ? ' ' + action.time : ' ' + action.session),
+    total ? '- Totale stimato: ' + euro(total) : '',
+    'Vuoi salvarlo?'
+  ].filter(Boolean).join('\n');
+  draft.awaiting = 'confirm';
+  return guidedResponse(lines, action, ['SALVA','Modifica prestazione','Modifica azienda','Modifica data/ora','Aggiungi nota','Annulla'], aiUi('intervention_wizard', 'confirm', draft, true));
+}
+function resolveNextInterventionStep(draft, ctx) {
+  const u = unresolvedService(draft);
+  if (u) { draft.awaiting = 'service_choice'; return buildServiceChoiceReply(draft, u); }
+  if (!draft.company?.id) { draft.awaiting = 'company_choice'; return buildCompanyChoiceReply(draft); }
+  if (!draft.date || (!draft.time && !draft.session)) { draft.awaiting = 'datetime_choice'; return buildDateTimeChoiceReply(draft); }
+  return interventionDraftToReply(draft, ctx);
+}
+function selectByButtonLabel(label, alternatives, kind) {
+  const n = norm(label).replace(/\s+(pc|pr|cr|lo|rm|mi|pv|mn|bs|bg)$/,'').trim();
+  return (alternatives || []).find(x => norm(candidateButtonLabel(x, kind)) === n || norm(x.nome || x.name) === n || norm(candidateButtonLabel(x, kind)).startsWith(n) || n.startsWith(norm(x.nome || x.name)));
+}
+function continuePendingInterventionDraft(userText, pendingDraft, ctx) {
+  const text = safeText(userText, 1000);
+  const n = norm(text);
+  const draft = JSON.parse(JSON.stringify(pendingDraft || {}));
+  if (!draft || draft.type !== 'intervention_draft') return null;
+  if (/^(annulla|cancella|reset|stop)$/.test(n)) return guidedResponse('Ok, ho annullato la bozza intervento.', null, [], aiUi('none', null, null, false));
+  if (/modifica prestazione/.test(n)) { const first = (draft.services || [])[0]; if (first) { first.serviceId = null; first.serviceName = null; } return resolveNextInterventionStep(draft, ctx); }
+  if (/modifica azienda/.test(n)) { draft.company = null; draft.companyRaw = ''; draft.companyAlternatives = []; return buildCompanyChoiceReply(draft); }
+  if (/modifica data|modifica ora/.test(n)) { draft.date = null; draft.time = null; draft.session = null; return buildDateTimeChoiceReply(draft); }
+  if (/aggiungi nota/.test(n)) { draft.awaiting = 'note_choice'; return guidedResponse('Che nota aggiungo?', draftAction(draft), ['Annulla'], aiUi('intervention_wizard','note_choice',draft,false)); }
+  if (draft.awaiting === 'note_choice') { draft.note = [draft.note, text].filter(Boolean).join(' | '); return resolveNextInterventionStep(draft, ctx); }
+  if (/aggiungi un altra|aggiungi un'altra|altra prestazione/.test(n)) { draft.services.push({ rawText: '', qty: 1, serviceId: null, serviceName: null, alternatives: [] }); draft.awaiting = 'service_choice'; return guidedResponse('Che prestazione aggiungo?', draftAction(draft), ['Annulla'], aiUi('intervention_wizard','service_choice',draft,false)); }
+  if (draft.awaiting === 'service_choice') {
+    let target = unresolvedService(draft) || (draft.services || [])[0];
+    let chosen = selectByButtonLabel(text, target?.alternatives || [], 'service');
+    if (!chosen) {
+      const cands = findServiceCandidates(text, ctx.services, { limit: 8 });
+      if (target) target.alternatives = cands.map(s => ({ id:s.id, nome:s.nome, name:s.nome, price:s.price, score:s.score }));
+      if (cands.length === 1) chosen = cands[0];
+      else if (target) return buildServiceChoiceReply(draft, target);
+    }
+    if (target && chosen) { target.serviceId = chosen.id; target.serviceName = chosen.nome || chosen.name; target.price = chosen.price; }
+    return resolveNextInterventionStep(draft, ctx);
+  }
+  if (draft.awaiting === 'company_choice') {
+    let chosen = selectByButtonLabel(text, draft.companyAlternatives || [], 'company');
+    if (!chosen) {
+      const cands = findCompanyCandidates(text, ctx.companies, { limit: 8 });
+      draft.companyRaw = text;
+      draft.companyAlternatives = cands.map(c => ({ id:c.id, nome:c.nome, ragioneSociale:c.ragioneSociale, comune:c.comune, provincia:c.provincia, addr:c.addr, score:c.score }));
+      if (cands.length === 1) chosen = cands[0];
+      else return buildCompanyChoiceReply(draft);
+    }
+    draft.company = { id: chosen.id, nome: chosen.nome, comune: chosen.comune, provincia: chosen.provincia };
+    return resolveNextInterventionStep(draft, ctx);
+  }
+  if (draft.awaiting === 'datetime_choice') {
+    const when = parseWhen(text, ctx.now);
+    if (/solo mattina/.test(n)) { draft.date = draft.date || isoDate(ctx.now); draft.session = 'm'; }
+    else if (/solo pomeriggio/.test(n)) { draft.date = draft.date || isoDate(ctx.now); draft.session = 'p'; }
+    else { draft.date = when.date || draft.date; draft.time = when.time || draft.time; draft.session = when.session || draft.session; }
+    return resolveNextInterventionStep(draft, ctx);
+  }
+  return resolveNextInterventionStep(draft, ctx);
+}
+function isInterventionDraftStart(text, ctx) {
+  const n = norm(text);
+  if (/\b(prezzo|quanto costa|listino|piva|fattura|fatture|ricavi|top|dashboard)\b/.test(n)) return false;
+  if (isCreateInterventionRequest(text)) return true;
+  if (/\b(\d+|un|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\s+\w+/.test(n) && extractRawServices(text, ctx).length) return true;
+  return false;
+}
 function buildCreateClientAction(text) {
   const raw = safeText(text, 4000);
   const after = raw.replace(/^.*?(?:crea|aggiungi|nuovo|inserisci)\s+(?:cliente|azienda)\s*/i, '').trim();
@@ -1021,27 +1258,10 @@ function createClientRequest(text, ctx) {
   return { reply: `Ho preparato il nuovo cliente: ${action.name}.\nRagione sociale: ${action.ragioneSociale || '-'}\nIndirizzo: ${[action.address, action.cap, action.comune, action.provincia].filter(Boolean).join(', ')}\nConfermi la creazione?`, action, actions: [], learn: [] };
 }
 function createInterventionRequest(text, ctx) {
-  if (!isCreateInterventionRequest(text)) return null;
-  const companyRes = resolveCompany(text, ctx.companies, { allowWeak: true });
-  if (!companyRes.match) {
-    if (companyRes.alternatives.length) return { reply: 'Ho trovato più clienti possibili:\n' + companyRes.alternatives.map((c,i)=>`${i+1}) ${c.nome}${c.comune ? ' · ' + c.comune : ''}`).join('\n') + '\nQuale devo usare?', action: null, actions: [], learn: [] };
-    const guessed = (safeText(text).match(/\bda\s+(.+?)(?:\s+(?:oggi|ieri|alle|ore|mattina|pomeriggio|sera|notte)|$)/i) || [])[1] || '';
-    return { reply: `Non trovo il cliente${guessed ? ' "' + guessed.trim() + '"' : ''} nel gestionale. Vuoi crearlo? Scrivi: CREA CLIENTE con ragione sociale e indirizzo.`, action: { type: 'create_intervention', companyName: guessed.trim(), companyId: '', services: [], date: '', time: '', session: '', note: 'Cliente non riconosciuto' }, actions: [], learn: [] };
-  }
-  const services = detectRequestedServices(text, ctx.services, { max: 10 });
-  if (!services.length) {
-    const serviceText = serviceTextFromRequest(text) || text;
-    const serviceRes = resolveServices(serviceText, ctx.services);
-    if (serviceRes.ambiguous) return response('Ho trovato più prestazioni possibili:\n' + serviceRes.alternatives.map((s,i)=>`${i+1}) ${s.nome}${s.price ? ' · ' + euro(s.price) : ''}`).join('\n') + '\nQuale devo usare?');
-    if (serviceRes.matches.length) services.push(...serviceRes.matches.map(s => ({ name:s.nome, nome:s.nome, id:s.id, qty:qtyNearService(text, s.nome) })));
-  }
-  if (!services.length) return response('Non ho riconosciuto la prestazione. Scrivimi il nome come nel listino oppure dimmi quale voce usare.');
-  const when = parseWhen(text, ctx.now);
-  const cleanServices = services.map(s => ({ name: s.name || s.nome, id: s.id, qty: Math.max(1, num(s.qty, 1)) }));
-  const action = { type: 'create_intervention', companyName: companyRes.match.nome, companyId: companyRes.match.id || '', services: cleanServices, date: when.date || '', time: when.time || '', session: when.session || '', note: 'Preparato da Rural Vet AI' };
-  const line = cleanServices.map(s => `${s.name}${s.qty > 1 ? ' x' + s.qty : ''}`).join(', ');
-  if (!action.date || !action.time) return response(`Ho capito: ${line} da ${companyRes.match.nome}.\nQuando lo registro?`, action, actionButtons('when'));
-  return response(`Ho capito: ${line} da ${companyRes.match.nome}, ${action.date} ore ${action.time}.\nScrivi SALVA per registrare nel gestionale.`, action, actionButtons('save'));
+  if (!isInterventionDraftStart(text, ctx)) return null;
+  const pending = ctx.raw?.pendingInterventionDraft;
+  if (pending && pending.type === 'intervention_draft') return continuePendingInterventionDraft(text, pending, ctx);
+  return parseInterventionDraft(text, ctx);
 }
 function deleteInterventionRequest(text, ctx) {
   if (!isDeleteRequest(text)) return null;
@@ -1052,6 +1272,7 @@ function deleteInterventionRequest(text, ctx) {
   return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
 }
 function deterministicRouter(text, ctx) {
+  if (ctx.raw?.pendingInterventionDraft?.type === 'intervention_draft') return continuePendingInterventionDraft(text, ctx.raw.pendingInterventionDraft, ctx);
   const handlers = [managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
   for (const h of handlers) {
     const ans = h(text, ctx);
@@ -1147,22 +1368,28 @@ async function generalAnswer(body, ctx) {
 }
 function validateAction(result, ctx) {
   if (!result) return result;
+  if (!result.ui) result.ui = aiUi();
   const all = [];
   if (result.action) all.push(result.action);
   if (Array.isArray(result.actions)) all.push(...result.actions);
+  let safe = !!result.ui.safeToApply;
   for (const a of all) {
-    if (!a || typeof a !== 'object') continue;
+    if (!a || typeof a !== 'object') { safe = false; continue; }
     if (a.type === 'create_intervention') {
-      if (a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) a.companyId = '';
-      if (Array.isArray(a.services)) {
-        for (const s of a.services) if (s.id && !ctx.services.some(p => String(p.id) === String(s.id))) s.id = '';
+      const v = validateInterventionAction(a, ctx);
+      if (!v.ok) {
+        safe = false;
+        result.quickReplies = (result.quickReplies || []).filter(q => String(q).toUpperCase() !== 'SALVA');
+        result.reply = result.reply || ('Non salvo ancora: mi manca ' + v.errors.join(', ') + '.');
       }
     }
-    if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) a.interventionId = '';
-    if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) a.companyId = '';
-    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) a.serviceId = '';
-    if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) a.invoiceId = '';
+    if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) { a.interventionId = ''; safe = false; }
+    if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) { a.companyId = ''; safe = false; }
+    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) { a.serviceId = ''; safe = false; }
+    if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) { a.invoiceId = ''; safe = false; }
   }
+  if (result.ui.mode === 'intervention_wizard' && result.ui.awaiting !== 'confirm') safe = false;
+  result.ui.safeToApply = safe;
   return result;
 }
 
@@ -1203,7 +1430,8 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     }
 
     result = validateAction(result, ctx);
-    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
+    if (String(process.env.AI_DEBUG || '').toLowerCase() === 'true') console.log('[AI_DEBUG]', JSON.stringify({ input:text, source, awaiting:result.ui?.awaiting || null, draftId:result.ui?.draftId || '', actionType:result.action?.type || '', safeToApply:!!result.ui?.safeToApply, counts:{companies:ctx.companies.length, services:ctx.services.length} }));
+    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || aiUi(), source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
     res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
@@ -1215,4 +1443,6 @@ app.post(['/api/ai', '/api/chat'], (req, res, next) => {
   app._router.handle(req, res, next);
 });
 
-app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
+if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
+
+export { buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates };
