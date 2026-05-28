@@ -1,0 +1,1 @@
+RM backend AI finale - versione 8.5.0-temporal-order. Backend Render senza index.html. Include memoria bozza, salvataggio sicuro, formatting pulito, ricavi/KM/prestazioni e ordine temporale nel giro: dopo/prima di/tra aziende.
