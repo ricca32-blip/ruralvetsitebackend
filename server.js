@@ -10,7 +10,7 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 9000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 24000);
-const VERSION = '8.0.0';
+const VERSION = '8.1.0-stateful';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' });
 
@@ -336,7 +336,7 @@ function buildContext(reqBody = {}) {
   const interventions = compactInterventions(raw, shell);
   const invoices = compactInvoices(raw, { ...shell, interventions });
   const kmRoutes = compactKm(raw);
-  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, pendingAnalyticsQuery: raw.pendingAnalyticsQuery || null, now: new Date() };
+  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now: new Date() };
 }
 
 function meaningfulTokens(s) {
@@ -373,8 +373,7 @@ function tokenScore(query, target, options = {}) {
       for (const tt of tTokens) {
         if (qt.length > 3 && tt.startsWith(qt)) score += 7;
         else if (tt.length > 3 && qt.startsWith(tt)) score += 5;
-        else if (qt.length >= 4 && tt.length >= 4 && levenshtein(qt, tt) <= 1) score += 18;
-        else if (qt.length >= 3 && tt.length >= 4 && (tt.startsWith(qt) || levenshtein(qt, tt.slice(0, qt.length)) <= 1)) score += 12;
+        else if (qt.length > 5 && tt.length > 5 && levenshtein(qt, tt) <= 1) score += 5;
       }
     }
   }
@@ -636,359 +635,69 @@ function periodForPrevious(period) {
   const prevFrom = addDays(prevTo, -days + 1);
   return { from: isoDate(prevFrom), to: isoDate(prevTo), label: `periodo precedente (${isoDate(prevFrom)} - ${isoDate(prevTo)})` };
 }
-
-
-function formatPercentValue(part, total) {
-  if (!total) return '0,0%';
-  return `${((num(part) / num(total)) * 100).toFixed(1).replace('.', ',')}%`;
-}
-function analyticsFieldText(...values) { return norm(values.filter(Boolean).join(' ')); }
-function isAnalyticsIntent(text) {
-  const n = norm(text);
-  return /\b(ricavi|ricavo|fatturato|fatturati|fatturare|fatture|fattura|incassato|incassi|pagato|pagata|da incassare|insolut|da pagare|da fatturare|non fatturat|economico|totale|top|classifica|maggior[ei]? ricavi|miglior|peggior|media|medie|trend|confront|dashboard|spaccato|dettaglio|percentuale|percentuali|%|mix|servizi piu venduti|servizi più venduti|prestazioni piu vendute|prestazioni più vendute|piu vendut|più vendut|per cliente|per azienda|per veterinario|per collaboratore|per prestazione|per servizio|prestazioni|servizi|quante|quanti|numero interventi|quanto ho fatto|quanto ha fatto|quanto ha fatturato|ytd|inizio anno|ultimo mese|questo mese|mese scorso|anno scorso|scorsa settimana|settimana scorsa|periodo)\b/.test(n);
-}
-function isCompanyInfoIntent(text) {
-  const n = norm(text);
-  return /\b(piva|partita iva|codice fiscale|\bcf\b|sdi|codice destinatario|pec|telefono|tel|cellulare|email|mail|indirizzo|via|sede|comune|provincia|km|chilometri|distanza|scheda azienda|dati azienda|anagrafica|referente|titolare)\b/.test(n)
-    && /\b(di|del|della|azienda|cliente|societa|società|allevamento|agricola|scheda|dati|anagrafica)\b/.test(n);
-}
-function analyticsPeriodDefault(text) {
-  const n = norm(text);
-  if (/\bquanto\s+ho\s+fatto\b|\bspaccato\b|\bper\s+prestaz|\bper\s+serviz|\bservizi\s+piu\s+vendut|\bprestazioni\s+piu\s+vendut/.test(n)) return 'month';
-  if (/\btop\b|\bclassifica\b|\bmaggior[ei]?\s+ricav|\bfatturat|\bcliente\s+miglior|\bazienda\s+ha/.test(n)) return 'ytd';
-  return 'ytd';
-}
-function parseAnalyticsPeriod(text, now = new Date()) {
-  const n = norm(text);
-  if (/\bultimo\s+mese\b/.test(n)) return { from: isoDate(addDays(now, -29)), to: isoDate(now), label: 'ultimi 30 giorni' };
-  if (/\bultim[ioe]?\s+30\s+giorn/.test(n)) return { from: isoDate(addDays(now, -29)), to: isoDate(now), label: 'ultimi 30 giorni' };
-  if (/\bultim[ao]?\s+trimestre\b|\bultimi\s+3\s+mesi\b/.test(n)) return { from: isoDate(addDays(now, -89)), to: isoDate(now), label: 'ultimi 90 giorni' };
-  const fallback = analyticsPeriodDefault(text) === 'month' ? 'month' : 'ytd';
-  if (fallback === 'month' && !/\b(inizio anno|ytd|anno|mese scorso|ultimo mese|ultimi|oggi|ieri|settimana|gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre|\d{1,2}[\/.-]\d{1,2})\b/.test(n)) {
-    return { from: `${now.getFullYear()}-${pad2(now.getMonth()+1)}-01`, to: isoDate(now), label: 'questo mese' };
-  }
-  return parsePeriod(text, now, 'ytd');
-}
-function detectAnalyticsMetric(text) {
-  const n = norm(text);
-  if (/\bda\s+fatturare\b|\bnon\s+fatturat/.test(n)) return 'to_invoice';
-  if (/\bda\s+incassare\b|\binsolut|\bda\s+pagare\b|\baperte\b|\bnon\s+pagat/.test(n)) return 'outstanding';
-  if (/\bincassat|\bincassi\b|\bpagat[eo]?\b/.test(n) && !/\bfatturat/.test(n)) return 'collected';
-  if (/\bfatturat|\bfatturare|\bfatture\s+emesse|\bfatture\b/.test(n)) return 'invoiced';
-  if (/\bquante\b|\bquanti\b|\bnumero\b|\bconteggio\b/.test(n)) return 'count';
-  if (/\b(servizi|prestazioni)\b.*\bpiu\b.*\bvendut|\b(servizi|prestazioni)\b.*\bpiù\b.*\bvendut|\bfrequent/.test(n)) return 'quantity';
-  return 'revenue';
-}
-function detectAnalyticsGroupBy(text) {
-  const n = norm(text);
-  if (/\bper\s+(prestaz|serviz)|\bspaccato\b|\bdettaglio\s+(prestaz|serviz)|\bprestazioni\s+rend|\bservizi\s+rend|\btop\s+(prestaz|serviz)|\b(servizi|prestazioni)\b.*\bpiu\b.*\bvendut|\b(servizi|prestazioni)\b.*\bpiù\b.*\bvendut|\bmix\b/.test(n)) return 'service';
-  if (/\bper\s+(veterinario|collaboratore|utente)|\btop\s+(veterinari|collaboratori|utenti)/.test(n)) return 'user';
-  if (/\bper\s+(cliente|azienda)|\btop\s+(clienti|aziende)|\bazienda\s+ha\s+(fatto|maggior)|\bquale\s+azienda|\bmaggior[ei]?\s+ricav|\bclienti\s+miglior|\bcliente\s+miglior/.test(n)) return 'company';
-  return null;
-}
-function analyticsCompanyLabel(c) {
-  return [c.nome || c.name, c.comune || c.city, c.provincia || c.province].filter(Boolean).join(' · ');
-}
-function analyticsServiceLabel(s) { return s.nome || s.name || String(s.id || 'Prestazione'); }
-function findCompanyCandidates(query, companies, { max = 8, allowWeak = true } = {}) {
-  const q = norm(query);
-  if (!q) return [];
-  const qTokens = meaningfulTokens(q);
-  const scored = companies.map(c => {
-    const fields = [c.nome, c.ragioneSociale, c.comune, c.provincia, c.addr, c.indirizzo, c.piva, c.cf, c.sdi, c.tel, c.email, c.raw?.alias, c.raw?.note, c.raw?.notes, c.raw?.referente, c.raw?.titolare].filter(Boolean);
-    const hay = norm(fields.join(' '));
-    const cleanedHay = norm(fields.join(' ').replace(/\b(azienda|agricola|societa|società|soc|s\.?s\.?|ss|srl|s\.?r\.?l\.?|snc|s\.?n\.?c\.?|sas|s\.?a\.?s\.?|f\.?lli|flli|fratelli|az|agr)\b/gi, ' '));
-    let score = Math.max(scoreCompany(q, c), tokenScore(q, hay, { strong:true }), tokenScore(q, cleanedHay, { strong:true }));
-    if (q === norm(c.nome) || q === norm(c.ragioneSociale)) score += 40;
-    if (qTokens.length && qTokens.every(t => hay.includes(t) || cleanedHay.includes(t))) score += 22;
-    if (q.length <= 4 && hay.split(' ').some(t => t.startsWith(q))) score += 30;
-    if (q.length <= 4 && cleanedHay.split(' ').some(t => t.startsWith(q))) score += 30;
-    const label = analyticsCompanyLabel(c);
-    return { id: c.id, name: c.nome, label, score, company: c };
-  }).filter(x => x.score >= (allowWeak ? 18 : 35)).sort((a,b)=>b.score-a.score || String(a.label).localeCompare(String(b.label)));
-  return uniqueBy(scored, x => String(x.id || x.label)).slice(0, max);
-}
-function findServiceCandidates(query, services, { max = 8, allowWeak = true } = {}) {
-  const expanded = String(query || '')
-    .replace(/\bartif\.?\b|\bartific\.?\b/g, 'artificiale')
-    .replace(/\bfec\.?\b|\bfecond\.?\b/g, 'fecondazione')
-    .replace(/\binsemin\.?\b/g, 'inseminazione')
-    .replace(/\beco\b/g, 'ecografia');
-  const q = canonicalServiceText(expanded);
-  if (!q) return [];
-  const scored = services.map(s => ({ id:s.id, name:s.nome, label:analyticsServiceLabel(s), score:scoreService(q, s), service:s }))
-    .filter(x => x.score >= (allowWeak ? 16 : 35))
-    .sort((a,b)=>b.score-a.score || String(a.label).localeCompare(String(b.label)));
-  return uniqueBy(scored, x => String(x.id || x.label)).slice(0, max);
-}
-function extractAnalyticsCompanyRaw(text, ctx) {
-  const raw = safeText(text, 1000);
-  const rxPeriod = /\b(da inizio anno|dall inizio anno|questo mese|mese scorso|ultimo mese|ultimi 30 giorni|oggi|ieri|anno scorso|quest anno|ytd|scorsa settimana|settimana scorsa|questa settimana|ultimi 7 giorni)\b/ig;
-  const withoutPeriod = raw.replace(rxPeriod, ' ');
-  let m = withoutPeriod.match(/(?:fatturato|fatturati|ricavi|incassato|da fatturare|da incassare|fatto)\s+(?:da|di|dell[aeo]?|azienda|cliente)?\s+(.+?)(?:\s+(?:da inizio|questo|ultimo|mese|anno|oggi|ieri|nel|nell|per|con|spaccato|scorsa|settimana)|\?|$)/i);
-  if (m && m[1]) {
-    const candidate = m[1].replace(/\b(quanto|ha|hanno|ho|fatto|fatturato|ricavi|incassato|azienda|cliente)\b/ig, ' ').trim();
-    if (candidate && findCompanyCandidates(candidate, ctx.companies, { max: 1 }).length) return candidate;
-  }
-  m = raw.match(/\b(?:da|di|del|della|cliente|azienda)\s+([A-Za-zÀ-ÿ0-9 .'-]{2,80}?)(?:\s+(?:da inizio|questo|ultimo|mese|anno|oggi|ieri|nel|nell|per|con|spaccato|scorsa|settimana)|\?|$)/i);
-  if (m && m[1]) {
-    const candidate = m[1].trim();
-    if (candidate && findCompanyCandidates(candidate, ctx.companies, { max: 1 }).length) return candidate;
-  }
-  const n = norm(raw);
-  for (const c of ctx.companies) {
-    const cname = norm(c.nome);
-    if (cname && cname.length > 2 && n.includes(cname)) return c.nome;
-    for (const tk of meaningfulTokens(c.nome)) if (tk.length > 3 && n.includes(tk)) return tk;
-  }
-  return '';
-}
-function extractAnalyticsServiceRaw(text, ctx) {
-  const n = norm(text);
-  const serviceWords = ['fecondazione','fecondazioni','inseminazione','cesareo','visita','ecografia','eco','mastite','metrite','terapia','vaccino','vaccinazione','parto','podale'];
-  for (const w of serviceWords) if (n.includes(w)) return w;
-  let m = safeText(text, 1000).match(/(?:quante|quanti|numero|conteggio|ricavi\s+per|spaccato\s+per)?\s*([A-Za-zÀ-ÿ0-9 .'-]{3,80}?)(?:\s+(?:questo mese|da inizio|ultimo mese|oggi|ieri|da|di|del|della|nell|nel)|\?|$)/i);
-  if (m && findServiceCandidates(m[1], ctx.services, { max:1 }).length) return m[1].trim();
-  return '';
-}
-function parseAnalyticsQuery(text, ctx, base = {}) {
-  const metric = base.metric || detectAnalyticsMetric(text);
-  let groupBy = base.groupBy !== undefined ? base.groupBy : detectAnalyticsGroupBy(text);
-  if (!groupBy && metric === 'quantity' && /\b(servizi|prestazioni)\b/.test(norm(text))) groupBy = 'service';
-  const period = base.period || parseAnalyticsPeriod(text, ctx.now);
-  const companyRaw = base.companyRaw !== undefined ? base.companyRaw : extractAnalyticsCompanyRaw(text, ctx);
-  const serviceRaw = base.serviceRaw !== undefined ? base.serviceRaw : (metric === 'count' || groupBy === 'service' ? extractAnalyticsServiceRaw(text, ctx) : '');
-  const limitMatch = norm(text).match(/\btop\s+(\d{1,2})\b/);
-  const includePercent = base.includePercent !== undefined ? base.includePercent : /%|percentual|spaccato|mix|quota/.test(norm(text));
-  const sortBy = base.sortBy || ((metric === 'quantity' || /\bpiu\b.*\bvendut|\bpiù\b.*\bvendut|\bfrequent/.test(norm(text))) ? 'quantity' : 'revenue');
-  return { type:'analytics_query', kind:'analytics', originalText: safeText(base.originalText || text, 1000), metric, groupBy, period, companyRaw, serviceRaw, companyIds: base.companyIds || [], serviceIds: base.serviceIds || [], awaiting: base.awaiting || '', limit: base.limit || (limitMatch ? Math.min(20, Number(limitMatch[1])) : 5), companyCandidates: base.companyCandidates || [], serviceCandidates: base.serviceCandidates || [], includePercent, sortBy };
-}
-function analyticsChoiceResponse(kind, query, candidates, label) {
-  const quick = candidates.map(c => c.label).slice(0, 6);
-  if (kind === 'company') quick.push(`Tutte le aziende ${label || query.companyRaw || 'simili'}`);
-  if (kind === 'service') quick.unshift(`Tutte le prestazioni ${label || query.serviceRaw || 'simili'}`);
-  quick.push('Annulla');
-  return { reply: kind === 'company' ? `Quale azienda ${label || query.companyRaw || ''} intendi?` : `Quale prestazione vuoi considerare?`, action: { type:'analytics_query', query: { ...query, awaiting: kind + '_choice', companyCandidates: query.companyCandidates, serviceCandidates: query.serviceCandidates } }, quickReplies: quick.slice(0, 8), ui: { mode:'analytics', awaiting: kind + '_choice', safeToApply:false }, clearDraft:false };
-}
-function resolveAnalyticsEntities(query, ctx) {
-  const q = { ...query };
-  if (q.companyRaw && !q.companyIds?.length) {
-    const candidates = findCompanyCandidates(q.companyRaw, ctx.companies, { max: 8, allowWeak: true });
-    q.companyCandidates = candidates;
-    if (candidates.length > 1) return { query:q, response:analyticsChoiceResponse('company', q, candidates, q.companyRaw) };
-    if (candidates.length === 1) q.companyIds = [candidates[0].id];
-    else return { query:q, response:{ reply:`Non ho trovato una corrispondenza sicura per l'azienda "${q.companyRaw}". Vuoi cercare meglio o considerare tutte le aziende?`, action:{ type:'analytics_query', query:q }, quickReplies:['Cerca meglio','Tutte le aziende','Annulla'], ui:{mode:'analytics', awaiting:'company_choice', safeToApply:false}, clearDraft:false } };
-  }
-  if (q.serviceRaw && !q.serviceIds?.length && (q.metric === 'count' || q.groupBy !== 'service')) {
-    const candidates = findServiceCandidates(q.serviceRaw, ctx.services, { max: 8, allowWeak: true });
-    q.serviceCandidates = candidates;
-    if (candidates.length > 1) return { query:q, response:analyticsChoiceResponse('service', q, candidates, q.serviceRaw) };
-    if (candidates.length === 1) q.serviceIds = [candidates[0].id];
-  }
-  return { query:q, response:null };
-}
-function analyticsInterventionRows(ctx, query) {
-  let ints = ctx.interventions.filter(i => inRange(i.data, query.period));
-  if (query.companyIds?.length) ints = ints.filter(i => query.companyIds.some(id => String(id) === String(i.aziendaId)));
-  const rows = [];
-  for (const i of ints) {
-    for (const s of (i.prestazioni || [])) {
-      if (query.serviceIds?.length && !query.serviceIds.some(id => String(id) === String(s.id))) continue;
-      const catalog = ctx.services.find(p => String(p.id) === String(s.id));
-      const qty = Math.max(1, num(s.qty, 1));
-      const price = num(s.price, num(catalog?.price, 0));
-      rows.push({ intervention:i, service:s, companyId:i.aziendaId, companyName:i.azienda || 'Senza azienda', serviceId:s.id, serviceName:s.nome || catalog?.nome || 'Prestazione', userName:i.userName || 'Utente', qty, total:num(s.total, price * qty), invoiced:!!i.fatt });
-    }
-  }
-  return rows;
-}
-function analyticsInvoiceRows(ctx, query) {
-  let invs = ctx.invoices.filter(f => inRange(f.data, query.period));
-  if (query.companyIds?.length) invs = invs.filter(f => query.companyIds.some(id => String(id) === String(f.aziendaId)));
-  return invs;
-}
-function grouped(rows, keyFn, totalFn, countFn) {
-  const m = new Map();
-  for (const r of rows) {
-    const key = keyFn(r) || 'Altro';
-    const old = m.get(key) || { key, total:0, count:0, qty:0 };
-    old.total += num(totalFn(r), 0);
-    old.count += 1;
-    old.qty += num(countFn ? countFn(r) : 1, 1);
-    m.set(key, old);
-  }
-  return [...m.values()].sort((a,b)=>b.total-a.total || b.qty-a.qty || String(a.key).localeCompare(String(b.key)));
-}
-function sortAnalyticsGroups(groups, query) {
-  if (query.sortBy === 'quantity' || query.metric === 'quantity' || query.metric === 'count') return groups.sort((a,b)=>b.qty-a.qty || b.total-a.total || String(a.key).localeCompare(String(b.key)));
-  return groups.sort((a,b)=>b.total-a.total || b.qty-a.qty || String(a.key).localeCompare(String(b.key)));
-}
-function buildAnalyticsResult(ctx, query) {
-  const metric = query.metric;
-  const periodTxt = periodLabel(query.period);
-  const isInvoiceMetric = ['invoiced','collected','outstanding'].includes(metric);
-  if (isInvoiceMetric) {
-    let invs = analyticsInvoiceRows(ctx, query);
-    if (metric === 'collected') invs = invs.filter(f => f.pagata);
-    if (metric === 'outstanding') invs = invs.filter(f => !f.pagata);
-    const total = invoiceTotal(invs);
-    const paid = invoiceTotal(invs.filter(f => f.pagata));
-    const open = invoiceTotal(invs.filter(f => !f.pagata));
-    if (query.groupBy === 'company') {
-      const rows = grouped(invs, f => f.azienda || 'Senza azienda', f => f.tot, () => 1).slice(0, query.limit || 5);
-      return { periodTxt, reply:`Periodo: ${periodTxt}.\n\nFatturato per azienda:\n` + rows.map((r,i)=>`${i+1}. ${r.key} · ${euro(r.total)} · ${r.count} fatture${query.includePercent ? ' · ' + formatPercentValue(r.total, total) : ''}`).join('\n') + `\n\nTotale: ${euro(total)}`, quickReplies:['Spaccato prestazioni','Da incassare','Questo mese','Da inizio anno'] };
-    }
-    const label = metric === 'collected' ? 'Incassato' : (metric === 'outstanding' ? 'Da incassare' : 'Fatturato');
-    return { periodTxt, reply:`Periodo: ${periodTxt}.\n${label}: ${euro(total)} su ${invs.length} fatture.` + (metric === 'invoiced' ? `\nIncassato: ${euro(paid)}.\nDa incassare: ${euro(open)}.` : ''), quickReplies:['Vedi fatture','Spaccato prestazioni','Questo mese','Da inizio anno'] };
-  }
-  const rows = analyticsInterventionRows(ctx, query);
-  const total = rows.reduce((s,r)=>s+num(r.total),0);
-  const qty = rows.reduce((s,r)=>s+num(r.qty),0);
-  const notInvoicedRows = rows.filter(r => !r.invoiced);
-  const notInvoiced = notInvoicedRows.reduce((s,r)=>s+num(r.total),0);
-  if (metric === 'to_invoice') return { periodTxt, reply:`Periodo: ${periodTxt}.\nDa fatturare: ${euro(notInvoiced)} (${notInvoicedRows.length} righe prestazione).`, quickReplies:['Top aziende','Spaccato prestazioni','Questo mese','Da inizio anno'] };
-  if (metric === 'count' && !query.groupBy) return { periodTxt, reply:`Periodo: ${periodTxt}.\nTotale: ${qty} prestazioni in ${new Set(rows.map(r => r.intervention.id)).size || rows.length} interventi.`, quickReplies:['Spaccato prestazioni','Top aziende','Questo mese','Da inizio anno'] };
-  if (query.groupBy === 'service') {
-    let g = grouped(rows, r => r.serviceName, r => r.total, r => r.qty);
-    g = sortAnalyticsGroups(g, query).slice(0, query.limit || 8);
-    if (!g.length) return { periodTxt, reply:`Periodo: ${periodTxt}.\nNon trovo prestazioni nel periodo.`, quickReplies:['Questo mese','Da inizio anno','Top aziende'] };
-    const title = (query.sortBy === 'quantity' || metric === 'quantity') ? 'Servizi più venduti' : 'Ricavi per prestazione';
-    return { periodTxt, reply:`Periodo: ${periodTxt}.\n\n${title}:\n` + g.map((r,i)=>`${i+1}. ${r.key} · ${r.qty} q.tà · ${euro(r.total)} · ${formatPercentValue(r.total, total)}`).join('\n') + `\n\nTotale ricavi: ${euro(total)}`, quickReplies:['Top aziende','Solo non fatturate','Questo mese','Mese scorso'] };
-  }
-  if (query.groupBy === 'company') {
-    let g = grouped(rows, r => r.companyName, r => r.total, r => r.qty);
-    g = sortAnalyticsGroups(g, query).slice(0, query.limit || 8);
-    if (!g.length) return { periodTxt, reply:`Periodo: ${periodTxt}.\nNon trovo ricavi nel periodo.`, quickReplies:['Spaccato prestazioni','Questo mese','Da inizio anno'] };
-    return { periodTxt, reply:`Periodo: ${periodTxt}.\n\nTop aziende per ricavi:\n` + g.map((r,i)=>`${i+1}. ${r.key} · ${euro(r.total)} · ${r.qty} q.tà · ${formatPercentValue(r.total, total)}`).join('\n') + `\n\nTotale periodo: ${euro(total)}`, quickReplies:['Spaccato prestazioni','Da fatturare','Questo mese','Mese scorso'] };
-  }
-  if (query.groupBy === 'user') {
-    const g = grouped(rows, r => r.userName, r => r.total, r => r.qty).slice(0, query.limit || 8);
-    return { periodTxt, reply:`Periodo: ${periodTxt}.\n\nRicavi per veterinario:\n` + g.map((r,i)=>`${i+1}. ${r.key} · ${euro(r.total)} · ${r.qty} q.tà · ${formatPercentValue(r.total, total)}`).join('\n') + `\n\nTotale: ${euro(total)}`, quickReplies:['Top aziende','Spaccato prestazioni','Questo mese'] };
-  }
-  return { periodTxt, reply:`Periodo: ${periodTxt}.\nRicavi interventi: ${euro(total)} (${rows.length} righe prestazione, ${qty} q.tà).\nDa fatturare: ${euro(notInvoiced)}.`, quickReplies:['Top aziende','Spaccato prestazioni','Da fatturare','Questo mese','Da inizio anno'] };
-}
-function buildAnalyticsReply(ctx, query) {
-  const resolved = resolveAnalyticsEntities(query, ctx);
-  if (resolved.response) return resolved.response;
-  const finalQuery = resolved.query;
-  const result = buildAnalyticsResult(ctx, finalQuery);
-  return { reply: result.reply, action: null, quickReplies: (result.quickReplies || []).slice(0,8), ui:{ mode:'analytics', awaiting:null, safeToApply:false }, clearDraft:true };
-}
-function parseCompanyInfoFields(text) {
-  const n = norm(text);
-  const fields = [];
-  if (/\bpiva\b|partita iva/.test(n)) fields.push('piva');
-  if (/\bcf\b|codice fiscale/.test(n)) fields.push('cf');
-  if (/\bsdi\b|codice destinatario/.test(n)) fields.push('sdi');
-  if (/\bpec\b/.test(n)) fields.push('pec');
-  if (/telefono|\btel\b|cellulare/.test(n)) fields.push('tel');
-  if (/email|\bmail\b/.test(n)) fields.push('email');
-  if (/indirizzo|\bvia\b|sede|comune|provincia/.test(n)) fields.push('address');
-  if (/\bkm\b|chilometri|distanza/.test(n)) fields.push('km');
-  if (/referente|titolare/.test(n)) fields.push('referente');
-  if (/scheda|dati azienda|anagrafica/.test(n) || !fields.length) return ['full'];
-  return uniqueBy(fields, x => x);
-}
-function extractCompanyInfoRaw(text, ctx) {
-  const raw = safeText(text, 1000);
-  let m = raw.match(/(?:piva|partita iva|codice fiscale|\bcf\b|sdi|codice destinatario|pec|telefono|tel|cellulare|email|mail|indirizzo|via|sede|km|chilometri|dati azienda|scheda azienda|anagrafica|referente|titolare)\s+(?:di|del|della|azienda|cliente)?\s+(.+?)(?:\?|$)/i);
-  if (m && m[1]) return m[1].trim();
-  m = raw.match(/(?:di|del|della|azienda|cliente)\s+([A-Za-zÀ-ÿ0-9 .'-]{2,80})(?:\?|$)/i);
-  if (m && m[1]) return m[1].trim();
-  const n = norm(raw);
-  for (const c of ctx.companies) {
-    for (const tk of meaningfulTokens(c.nome)) if (tk.length > 3 && n.includes(tk)) return tk;
-  }
-  return '';
-}
-function parseCompanyInfoQuery(text, ctx, base = {}) {
-  return { type:'analytics_query', kind:'company_info', originalText: safeText(base.originalText || text, 1000), fields: base.fields || parseCompanyInfoFields(text), companyRaw: base.companyRaw !== undefined ? base.companyRaw : extractCompanyInfoRaw(text, ctx), companyIds: base.companyIds || [], companyCandidates: base.companyCandidates || [], awaiting: base.awaiting || '' };
-}
-function companyInfoValue(company, field) {
-  const raw = company.raw || {};
-  if (field === 'piva') return company.piva || raw.partitaIva || raw.vat || '';
-  if (field === 'cf') return company.cf || raw.codiceFiscale || '';
-  if (field === 'sdi') return company.sdi || raw.codiceDestinatario || raw.codice_destinatario || '';
-  if (field === 'pec') return raw.pec || raw.PEC || '';
-  if (field === 'tel') return company.tel || raw.telefono || raw.phone || '';
-  if (field === 'email') return company.email || raw.mail || '';
-  if (field === 'address') return [company.addr, company.cap, company.comune, company.provincia].filter(Boolean).join(', ');
-  if (field === 'km') return company.km ? `${company.km} km` : '';
-  if (field === 'referente') return raw.referente || raw.titolare || raw.owner || '';
-  return '';
-}
-function buildCompanyInfoFinal(ctx, query) {
-  const company = ctx.companies.find(c => String(c.id) === String(query.companyIds?.[0]));
-  if (!company) return { reply:'Non ho trovato l\'azienda nel gestionale.', action:null, quickReplies:['Cerca meglio','Annulla'], ui:{mode:'analytics', awaiting:null, safeToApply:false}, clearDraft:true };
-  const name = analyticsCompanyLabel(company) || company.nome;
-  const fields = query.fields?.includes('full') ? ['address','piva','cf','sdi','pec','tel','email','km','referente'] : query.fields;
-  const labels = { address:'Indirizzo', piva:'P.IVA', cf:'CF', sdi:'SDI', pec:'PEC', tel:'Telefono', email:'Email', km:'Km', referente:'Referente' };
-  const lines = fields.map(f => `- ${labels[f] || f}: ${companyInfoValue(company, f) || 'non registrato'}`);
-  return { reply:`${name}\n${lines.join('\n')}`, action:null, quickReplies:['Scheda completa','Telefono','Email','P.IVA','SDI','Annulla'].slice(0,6), ui:{mode:'analytics', awaiting:null, safeToApply:false}, clearDraft:true };
-}
-function companyInfoChoiceResponse(query) {
-  const quick = query.companyCandidates.map(c => c.label).slice(0, 6);
-  quick.push(`Tutte le aziende ${query.companyRaw || 'simili'}`);
-  quick.push('Annulla');
-  return { reply:`Quale azienda ${query.companyRaw || ''} intendi?`, action:{ type:'analytics_query', query:{ ...query, awaiting:'company_choice' } }, quickReplies:quick.slice(0,8), ui:{mode:'analytics', awaiting:'company_choice', safeToApply:false}, clearDraft:false };
-}
-function buildCompanyInfoReply(ctx, query) {
-  const q = { ...query };
-  if (!q.companyIds?.length) {
-    const candidates = findCompanyCandidates(q.companyRaw, ctx.companies, { max:8, allowWeak:true });
-    q.companyCandidates = candidates;
-    if (candidates.length > 1) return companyInfoChoiceResponse(q);
-    if (candidates.length === 1) q.companyIds = [candidates[0].id];
-    else return { reply:`Non ho trovato una corrispondenza sicura per l'azienda "${q.companyRaw || ''}".`, action:{ type:'analytics_query', query:q }, quickReplies:['Cerca meglio','Annulla'], ui:{mode:'analytics', awaiting:'company_choice', safeToApply:false}, clearDraft:false };
-  }
-  if (q.companyIds.length > 1) {
-    const rows = q.companyIds.map(id => ctx.companies.find(c => String(c.id) === String(id))).filter(Boolean).map(c => `- ${analyticsCompanyLabel(c)}`);
-    return { reply:`Ho trovato queste aziende:\n${rows.join('\n')}`, action:null, quickReplies:['P.IVA','Telefono','Email','Annulla'], ui:{mode:'analytics', awaiting:null, safeToApply:false}, clearDraft:true };
-  }
-  return buildCompanyInfoFinal(ctx, q);
-}
-function companyInfoQuery(text, ctx) {
-  if (!isCompanyInfoIntent(text)) return null;
-  return buildCompanyInfoReply(ctx, parseCompanyInfoQuery(text, ctx));
-}
-function continueAnalyticsQuery(text, pending, ctx) {
-  const n = norm(text);
-  if (!pending || (pending.type !== 'analytics_query' && pending.type !== 'data_query')) return null;
-  if (/^annulla$/.test(n)) return { reply:'Ok, annullato.', action:null, quickReplies:['Top aziende','Spaccato prestazioni'], ui:{mode:'analytics', awaiting:null, safeToApply:false}, clearDraft:true };
-  const isCompanyInfo = pending.kind === 'company_info';
-  const q = isCompanyInfo ? parseCompanyInfoQuery(pending.originalText || text, ctx, pending) : parseAnalyticsQuery(pending.originalText || text, ctx, pending);
-  if (pending.awaiting === 'company_choice') {
-    const candidates = asArray(pending.companyCandidates);
-    if (/\btutte\b/.test(n)) q.companyIds = candidates.map(c => c.id).filter(Boolean);
-    else {
-      const found = candidates.find(c => norm(c.label) === n || norm(c.name) === n || n.includes(norm(c.name)) || norm(c.label).includes(n));
-      if (found) q.companyIds = [found.id];
-      else {
-        q.companyRaw = text;
-        q.companyIds = [];
-      }
-    }
-    q.awaiting = '';
-    return isCompanyInfo ? buildCompanyInfoReply(ctx, q) : buildAnalyticsReply(ctx, q);
-  }
-  if (pending.awaiting === 'service_choice') {
-    const candidates = asArray(pending.serviceCandidates);
-    if (/\btutte\b/.test(n)) q.serviceIds = candidates.map(c => c.id).filter(Boolean);
-    else {
-      const found = candidates.find(c => norm(c.label) === n || norm(c.name) === n || n.includes(norm(c.name)) || norm(c.label).includes(n));
-      if (found) q.serviceIds = [found.id];
-    }
-    q.awaiting = '';
-    return buildAnalyticsReply(ctx, q);
-  }
-  return null;
-}
 function analyticsQuery(text, ctx) {
-  if (!isAnalyticsIntent(text)) return null;
-  const query = parseAnalyticsQuery(text, ctx);
-  return buildAnalyticsReply(ctx, query);
-}
+  const n = norm(text);
+  const wants = /\b(ricavi|ricavo|fatturato|fatturati|fatture|fattura|incassato|incassi|pagato|pagata|da pagare|da fatturare|economico|totale|top|classifica|miglior|peggior|media|medie|trend|per cliente|per azienda|per veterinario|per collaboratore|per prestazione|per mese|per giorno|scadut|aperte|imponibile|iva|ytd|inizio anno|anno|mese|settimana)\b/.test(n);
+  if (!wants) return null;
+  const filters = managementFilters(text, ctx, /\boggi\b|\bgiorno\b/.test(n) ? 'today' : 'ytd');
+  if (filters.companyResult.ambiguous) return response('Ho trovato più clienti possibili:\n' + filters.companyResult.alternatives.map((a,i)=>`${i+1}) ${a.nome}`).join('\n') + '\nQuale intendi?');
+  const ints = filterInterventions(ctx, filters);
+  const invs = filterInvoices(ctx, filters);
+  const invPaid = invs.filter(f => f.pagata);
+  const invUnpaid = invs.filter(f => !f.pagata);
+  const invoicedInts = ints.filter(i => i.fatt);
+  const notInvoicedInts = ints.filter(i => !i.fatt);
+  const scope = displayScope(filters) || periodLabel(filters.period);
+  const ricavi = interventionTotal(ints);
+  const fattureEmesse = invoiceTotal(invs);
+  const incassato = invoiceTotal(invPaid);
+  const aperte = invoiceTotal(invUnpaid);
+  const daFatturare = interventionTotal(notInvoicedInts);
+  const imponibile = invs.reduce((s,f)=>s+num(f.imponibile, 0),0);
+  const iva = invs.reduce((s,f)=>s+num(f.iva, 0),0);
+  const todayIso = isoDate(ctx.now);
+  const scadute = invUnpaid.filter(f => f.scadenza && f.scadenza < todayIso);
 
+  if (/\bscadut/.test(n)) {
+    if (!scadute.length) return response(`Non risultano fatture scadute per ${scope}.`);
+    return response(`Fatture scadute ${scope}: ${scadute.length}, totale ${euro(invoiceTotal(scadute))}.\n` + scadute.slice(0,15).map(f => `- ${formatInvoice(f)}${f.scadenza ? ' · scad. ' + f.scadenza : ''}`).join('\n'));
+  }
+  if (/\btop\b|\bclassifica\b|\bmiglior/.test(n) || /per\s+(cliente|azienda|veterinario|collaboratore|prestazione|mese|giorno)/.test(n)) {
+    let rows = [];
+    const byService = /per\s+prestaz|top\s+prestaz|classifica\s+prestaz|miglior[ie]?\s+prestaz/.test(n);
+    const byUser = /per\s+(veterinario|collaboratore|utente)|top\s+(veterinari|collaboratori|utenti)|classifica\s+(veterinari|collaboratori|utenti)/.test(n);
+    const byMonth = /per\s+mese|mese\s+per\s+mese|mensil/.test(n);
+    const byDay = /per\s+(giorno|giornata|data)|giorno\s+per\s+giorno|giornalier/.test(n);
+    if (byService) rows = serviceTotalRows(ints).map(r => ({ key: r.key, count: r.qty, total: r.total, detail: `${r.qty} q.tà · ${r.count} interventi` }));
+    else if (byUser) rows = groupMap(ints, i => i.userName || i.userId || 'Utente').map(r => ({...r, detail: `${r.count} interventi`}));
+    else if (byMonth) rows = groupMap(ints, i => monthKey(i.data)).map(r => ({...r, detail: `${r.count} interventi`}));
+    else if (byDay) rows = groupMap(ints, i => dayKey(i.data)).map(r => ({...r, detail: `${r.count} interventi`}));
+    else rows = groupMap(ints, i => i.azienda || 'Cliente').map(r => ({...r, detail: `${r.count} interventi`}));
+    if (!rows.length) return response(`Non ho dati per fare la classifica ${scope}.`);
+    return response(`Classifica ${scope}:\n` + rows.slice(0,12).map((r,i)=>`${i+1}) ${r.key}: ${euro(r.total)} · ${r.detail || (r.count + ' interventi')} · ${pct(r.total, ricavi)}`).join('\n'));
+  }
+  if (/\bmedia|medie|ticket medio|valore medio/.test(n)) {
+    const byDay = groupMap(ints, i => dayKey(i.data));
+    const activeDays = byDay.length;
+    return response(`Medie ${scope}:\nRicavo medio/intervento: ${euro(avg(ricavi, ints.length))}.\nInterventi medi/giorno attivo: ${activeDays ? (ints.length / activeDays).toFixed(1).replace('.', ',') : '0'}.\nRicavo medio/giorno attivo: ${euro(avg(ricavi, activeDays))}.\nFattura media emessa: ${euro(avg(fattureEmesse, invs.length))}.`);
+  }
+  if (/\bconfront|trend|vs\b|rispetto/.test(n)) {
+    const prev = periodForPrevious(filters.period);
+    const prevInts = prev ? filterInterventions(ctx, { ...filters, period: prev }) : [];
+    const prevTot = interventionTotal(prevInts);
+    const delta = ricavi - prevTot;
+    const sign = delta >= 0 ? '+' : '';
+    return response(`Confronto ${scope}:\nPeriodo attuale: ${euro(ricavi)} (${ints.length} interventi).\n${prev ? 'Periodo precedente: ' + euro(prevTot) + ' (' + prevInts.length + ' interventi).' : 'Periodo precedente non calcolabile.'}\nDifferenza: ${sign}${euro(delta)}${prevTot ? ' · ' + sign + pct(delta, prevTot) : ''}.`);
+  }
+  if (/\bda fatturare\b|\bnon fatturat/.test(n)) return response(`Da fatturare ${scope}: ${euro(daFatturare)} (${notInvoicedInts.length} interventi).`);
+  if (/\bda pagare\b|\bnon pagat|\baperte\b/.test(n)) return response(`Da pagare ${scope}: ${euro(aperte)} (${invUnpaid.length} fatture aperte).`);
+  if (/\bincass|\bpagat/.test(n) && !/fatturato/.test(n)) return response(`Incassato ${scope}: ${euro(incassato)} (${invPaid.length} fatture pagate).`);
+  if (/\bfatture\b|\bfattura\b/.test(n) && (/\bmostra\b|\belenca\b|\blista\b|\bdammi\b/.test(n))) {
+    if (!invs.length) return response(`Non trovo fatture per ${scope}.`);
+    return response(`Fatture ${scope}: ${invs.length}, totale ${euro(fattureEmesse)}.\n` + invs.slice(0, 15).map(f => `- ${formatInvoice(f)}`).join('\n') + (invs.length > 15 ? `\n+ altre ${invs.length - 15}` : ''));
+  }
+  return response(`Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(interventionTotal(invoicedInts))} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} (${invs.length}) · Imponibile: ${euro(imponibile)} · IVA: ${euro(iva)}.\nIncassato: ${euro(incassato)} · Da pagare: ${euro(aperte)}${scadute.length ? ' · Scadute: ' + euro(invoiceTotal(scadute)) : ''}.`, null, ['Top clienti', 'Da fatturare', 'Fatture aperte', 'Ricavi per prestazione']);
+}
 function parseClientFields(text) {
   const raw = safeText(text, 4000);
   const fields = {};
@@ -1342,12 +1051,374 @@ function deleteInterventionRequest(text, ctx) {
   if (items.length === 1) return { reply: `Ho trovato questo intervento:\n- ${formatIntervention(items[0])}\nScrivi ELIMINA per cancellarlo.`, action: { type: 'delete_intervention', interventionId: items[0].id, query: text, note: 'Richiesta eliminazione da AI' }, actions: [], learn: [] };
   return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
 }
-function deterministicRouter(text, ctx) {
-  if (ctx.pendingAnalyticsQuery) {
-    const pending = continueAnalyticsQuery(text, ctx.pendingAnalyticsQuery, ctx);
-    if (pending) return pending;
+
+
+
+// === Rural Vet AI state guard, edit/delete helpers v12 ===
+function rvDebug(label, payload = {}) {
+  if (process.env.AI_DEBUG !== 'true') return;
+  try { console.log('[RV_AI]', label, JSON.stringify(payload).slice(0, 4000)); } catch { console.log('[RV_AI]', label, payload); }
+}
+function rvFreshDraft(draft, bodySessionId = '') {
+  if (!draft || typeof draft !== 'object') return null;
+  const now = Date.now();
+  const created = Date.parse(draft.createdAt || draft.updatedAt || '') || now;
+  const ttl = draft.type === 'delete_intervention_draft' ? 5*60*1000 : draft.type === 'analytics_query' ? 10*60*1000 : 20*60*1000;
+  if (now - created > ttl) return null;
+  if (bodySessionId && draft.aiSessionId && draft.aiSessionId !== bodySessionId) return null;
+  return draft;
+}
+function rvWithState(result, state = {}) {
+  result = result || { reply: 'Dimmi meglio cosa vuoi fare.', action: null, actions: [], learn: [] };
+  result.state = {
+    pendingInterventionDraft: state.pendingInterventionDraft ?? null,
+    pendingEditInterventionDraft: state.pendingEditInterventionDraft ?? null,
+    pendingDeleteInterventionDraft: state.pendingDeleteInterventionDraft ?? null,
+    pendingAnalyticsQuery: state.pendingAnalyticsQuery ?? null,
+    pendingDataQuery: state.pendingDataQuery ?? null
+  };
+  result.clearState = !!state.clearState;
+  return result;
+}
+function rvActionButtons(kind) {
+  if (kind === 'save') return ['SALVA','Modifica ancora','Annulla'];
+  if (kind === 'delete') return ['ELIMINA','Annulla'];
+  return ['Annulla'];
+}
+function rvInterventionLabel(i) {
+  return `${i.azienda || 'Azienda'} · ${i.data || '?'} ${i.ora || i.sess || ''} · ${asArray(i.prestazioni).map(p => `${p.nome}${p.qty > 1 ? ' x'+p.qty : ''}`).join(' + ') || 'intervento'}`.trim();
+}
+function rvServiceNameList(services) { return asArray(services).map(s => s.nome || s.name || '').filter(Boolean).join(' + '); }
+function rvInterventionCandidates(text, ctx) {
+  const n = norm(text);
+  const period = parsePeriod(text, ctx.now, /\boggi\b/.test(n) ? 'today' : 'ytd');
+  const companyRaw = rvExtractCompanyRaw(text) || textAfter(text, /(?:intervento|prestazione|parto|fecondazione|visita|eco|ecografia|cesareo)\s+(?:di|da|per)?\s*([^,;.]+?)(?:\s+(?:oggi|ieri|alle|ore|del|di|con)|$)/i) || '';
+  const compCands = companyRaw ? rvCompanyCandidates(companyRaw, ctx.companies) : [];
+  const compIds = new Set(compCands.slice(0, 4).map(c => String(c.id)));
+  const servicePhrases = rvExtractServicePhrases(text, ctx).filter(x => !/intervento|prestazione/i.test(x.rawText));
+  const serviceCands = servicePhrases.flatMap(x => rvServiceCandidates(x.rawText, ctx.services)).slice(0, 10);
+  const serviceNames = serviceCands.map(s => norm(s.name));
+  const scored = ctx.interventions.map(i => {
+    let score = 0;
+    if (period && inRange(i.data, period)) score += 30;
+    if (compIds.has(String(i.aziendaId))) score += 55;
+    if (companyRaw && tokenScore(companyRaw, i.azienda) > 20) score += 35;
+    const ptxt = rvServiceNameList(i.prestazioni);
+    if (serviceNames.some(sn => norm(ptxt).includes(sn) || sn.includes(norm(ptxt)))) score += 35;
+    for (const sp of servicePhrases) if (tokenScore(sp.rawText, ptxt) > 25) score += 18;
+    const when = parseWhen(text, ctx.now);
+    if (when.time && i.ora && i.ora.slice(0,2) === when.time.slice(0,2)) score += 15;
+    if (/\bieri\b|\boggi\b|\bdomani\b/.test(n) && period && inRange(i.data, period)) score += 12;
+    return { item: i, score };
+  }).filter(x => x.score >= 20).sort((a,b)=>b.score-a.score || String(b.item.data).localeCompare(String(a.item.data)) || String(b.item.ora).localeCompare(String(a.item.ora))).slice(0, 10);
+  return scored.map(x => ({ id: x.item.id, label: rvInterventionLabel(x.item), intervention: x.item, score: x.score }));
+}
+function rvIsEditInterventionIntent(text) {
+  const n = norm(text);
+  return /\b(modifica|cambia|sposta|correggi|aggiorna|togli|rimuovi|sostituisci|nota)\b/.test(n) && /\b(intervento|prestazione|parto|fecondazione|visita|ecografia|cesareo|nota|ora|data)\b/.test(n) || (/\baggiungi\b/.test(n) && /\ball\s*intervento|all intervento|intervento di|intervento da|intervento\b/.test(n));
+}
+function rvIsDeleteInterventionIntent(text) {
+  return /\b(elimina|cancella|rimuovi|annulla|togli)\b/.test(norm(text)) && /\b(intervento|prestazione|parto|fecondazione|visita|ecografia|cesareo)\b/.test(norm(text));
+}
+function rvParseEditChanges(text, ctx) {
+  const n = norm(text); const changes = { addServices: [], removeServices: [], replaceServices: [], companyId: null, companyName: '', date: '', time: '', session: '', note: null };
+  const when = parseWhen(text, ctx.now); if (when.date) changes.date = when.date; if (when.time) changes.time = when.time; if (when.session) changes.session = when.session;
+  const note = textAfter(text, /(?:nota|note|appunto)\s*[:=]?\s*(.+)$/i); if (note) changes.note = note;
+  const newCompany = textAfter(text, /(?:cambia|modifica|sposta).{0,30}(?:azienda|cliente)\s+(?:in|a|con|da)\s+(.+?)(?:\s+(?:oggi|ieri|alle|ore|e|con|prestazione)|$)/i);
+  if (newCompany) { const c = rvCompanyCandidates(newCompany, ctx.companies)[0]; if (c) { changes.companyId = c.id; changes.companyName = c.name; } }
+  if (/\b(aggiungi|metti anche|aggiungi anche)\b/.test(n)) {
+    for (const p of rvExtractServicePhrases(text.replace(/^.*?\b(?:aggiungi anche|aggiungi|metti anche)\b/i,''), ctx)) {
+      const cand = rvServiceCandidates(p.rawText, ctx.services)[0]; changes.addServices.push({ rawText:p.rawText, qty:p.qty, serviceId:cand?.id||null, serviceName:cand?.name||p.rawText });
+    }
   }
-  const handlers = [managementHelpQuery, learnQuery, companyInfoQuery, analyticsQuery, dashboardQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, revenueQuery, interventionQuery];
+  if (/\b(togli|rimuovi|elimina)\b/.test(n)) {
+    for (const p of rvExtractServicePhrases(text.replace(/^.*?\b(?:togli|rimuovi|elimina)\b/i,''), ctx)) changes.removeServices.push({ rawText:p.rawText, qty:p.qty });
+  }
+  return changes;
+}
+function rvEditDraftResponse(reply, draft, quickReplies = [], extra = {}) { return rvWithState({ reply, action: { type:'edit_intervention_draft', draft }, actions: [], learn: [], quickReplies, ui:{ mode:'edit_intervention', awaiting:draft.awaiting||null, draftId:draft.draftId, safeToApply:false }, ...extra }, { pendingEditInterventionDraft: draft }); }
+function rvDeleteDraftResponse(reply, draft, quickReplies = [], extra = {}) { return rvWithState({ reply, action: { type:'delete_intervention_draft', draft }, actions: [], learn: [], quickReplies, ui:{ mode:'delete_intervention', awaiting:draft.awaiting||null, draftId:draft.draftId, safeToApply:false }, ...extra }, { pendingDeleteInterventionDraft: draft }); }
+function rvBuildEditAction(draft) { return { type:'update_intervention', interventionId:draft.interventionId, updates:draft.changes, query:draft.originalText }; }
+function rvResolveEditDraft(draft, ctx) {
+  if (!draft.interventionId) {
+    draft.interventionCandidates = rvInterventionCandidates(draft.originalText, ctx);
+    if (!draft.interventionCandidates.length) { draft.awaiting='intervention_choice'; return rvEditDraftResponse('Non trovo l’intervento da modificare. Dimmi azienda, giorno e prestazione.', draft, ['Cerca ultimi interventi','Annulla']); }
+    if (draft.interventionCandidates.length === 1) { draft.interventionId = draft.interventionCandidates[0].id; }
+    else { draft.awaiting='intervention_choice'; return rvEditDraftResponse('Quale intervento vuoi modificare?', draft, draft.interventionCandidates.map(c=>c.label).concat(['Annulla'])); }
+  }
+  draft.awaiting = 'confirm';
+  const target = ctx.interventions.find(i => String(i.id) === String(draft.interventionId));
+  const lines = [];
+  if (draft.changes.date || draft.changes.time || draft.changes.session) lines.push(`Data/ora: ${[draft.changes.date, draft.changes.time || draft.changes.session].filter(Boolean).join(' ')}`);
+  if (draft.changes.addServices?.length) lines.push('Aggiungi: ' + draft.changes.addServices.map(s=>`${s.serviceName || s.rawText} x${s.qty||1}`).join(', '));
+  if (draft.changes.removeServices?.length) lines.push('Togli: ' + draft.changes.removeServices.map(s=>s.rawText).join(', '));
+  if (draft.changes.companyId) lines.push('Azienda: ' + draft.changes.companyName);
+  if (draft.changes.note) lines.push('Nota: ' + draft.changes.note);
+  if (!lines.length) lines.push('Modifica richiesta: ' + draft.originalText);
+  const action = rvBuildEditAction(draft);
+  return rvWithState({ reply:`Ho preparato la modifica:\n- Intervento: ${target ? rvInterventionLabel(target) : draft.interventionId}\n${lines.map(x=>'- '+x).join('\n')}\n\nVuoi salvare?`, action, actions:[], learn:[], quickReplies:rvActionButtons('save'), ui:{ mode:'edit_intervention', awaiting:'confirm', draftId:draft.draftId, safeToApply:true } }, { pendingEditInterventionDraft: draft });
+}
+function rvNewEditDraft(text, ctx) { const d = { type:'edit_intervention_draft', aiSessionId:ctx.raw?.aiSessionId || '', draftId:'edit_'+Date.now()+'_'+Math.random().toString(36).slice(2,7), originalText:safeText(text,500), interventionCandidates:[], interventionId:null, changes:rvParseEditChanges(text,ctx), awaiting:null, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString() }; return rvResolveEditDraft(d, ctx); }
+function rvContinueEditDraft(text, draft, ctx) {
+  const input = safeText(text,500); const n = norm(input); draft.updatedAt = new Date().toISOString();
+  if (/^(annulla|cancella|stop|reset)$/i.test(input)) return rvWithState({ reply:'Ok, modifica annullata.', action:null, actions:[], learn:[], quickReplies:[], clearDraft:true, clearState:true, ui:{mode:'none', awaiting:null, draftId:draft.draftId, safeToApply:false}}, { clearState:true });
+  if (draft.awaiting === 'intervention_choice') { const chosen = asArray(draft.interventionCandidates).find(c => norm(c.label) === n || n.includes(norm(c.label)) || norm(c.label).includes(n)); if (chosen) { draft.interventionId = chosen.id; return rvResolveEditDraft(draft, ctx); } }
+  const ch = rvParseEditChanges(input, ctx); Object.assign(draft.changes, { ...draft.changes, ...Object.fromEntries(Object.entries(ch).filter(([k,v]) => Array.isArray(v) ? v.length : !!v)) });
+  return rvResolveEditDraft(draft, ctx);
+}
+function rvNewDeleteDraft(text, ctx) { const d = { type:'delete_intervention_draft', aiSessionId:ctx.raw?.aiSessionId || '', draftId:'del_'+Date.now()+'_'+Math.random().toString(36).slice(2,7), originalText:safeText(text,500), interventionCandidates:rvInterventionCandidates(text, ctx), interventionId:null, awaiting:null, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString() }; return rvResolveDeleteDraft(d, ctx); }
+function rvResolveDeleteDraft(draft, ctx) {
+  if (!draft.interventionId) {
+    if (!draft.interventionCandidates.length) { draft.awaiting='intervention_choice'; return rvDeleteDraftResponse('Non trovo l’intervento da eliminare. Dimmi azienda, giorno e prestazione.', draft, ['Vedi ultimi interventi','Annulla']); }
+    if (draft.interventionCandidates.length === 1) draft.interventionId = draft.interventionCandidates[0].id;
+    else { draft.awaiting='intervention_choice'; return rvDeleteDraftResponse('Quale intervento vuoi eliminare?', draft, draft.interventionCandidates.map(c=>c.label).concat(['Annulla'])); }
+  }
+  draft.awaiting='confirm'; const target = ctx.interventions.find(i => String(i.id) === String(draft.interventionId));
+  const action = { type:'delete_intervention', interventionId:draft.interventionId, query:draft.originalText };
+  return rvWithState({ reply:`Ho trovato questo intervento:\n- ${target ? rvInterventionLabel(target) : draft.interventionId}\n\nVuoi eliminarlo?`, action, actions:[], learn:[], quickReplies:rvActionButtons('delete'), ui:{ mode:'delete_intervention', awaiting:'confirm', draftId:draft.draftId, safeToApply:true } }, { pendingDeleteInterventionDraft: draft });
+}
+function rvContinueDeleteDraft(text, draft, ctx) {
+  const input = safeText(text,500); const n = norm(input); draft.updatedAt = new Date().toISOString();
+  if (/^(annulla|cancella|stop|reset)$/i.test(input)) return rvWithState({ reply:'Ok, eliminazione annullata.', action:null, actions:[], learn:[], quickReplies:[], clearDraft:true, clearState:true, ui:{mode:'none', awaiting:null, draftId:draft.draftId, safeToApply:false}}, { clearState:true });
+  if (draft.awaiting === 'intervention_choice') { const chosen = asArray(draft.interventionCandidates).find(c => norm(c.label) === n || n.includes(norm(c.label)) || norm(c.label).includes(n)); if (chosen) { draft.interventionId = chosen.id; return rvResolveDeleteDraft(draft, ctx); } }
+  return rvResolveDeleteDraft(draft, ctx);
+}
+function rvPendingOrPriority(text, ctx) {
+  const sid = ctx.raw?.aiSessionId || '';
+  const pDel = rvFreshDraft(ctx.raw?.pendingDeleteInterventionDraft, sid);
+  const pEdit = rvFreshDraft(ctx.raw?.pendingEditInterventionDraft, sid);
+  const pInt = rvFreshDraft(ctx.raw?.pendingInterventionDraft || ctx.raw?.pendingDraft, sid);
+  rvDebug('route', { input:text, pendingDelete:!!pDel, pendingEdit:!!pEdit, pendingIntervention:!!pInt, sid });
+  if (/^(annulla|cancella|stop|reset)$/i.test(safeText(text,200).trim())) return rvWithState({ reply:'Operazione annullata.', action:null, actions:[], learn:[], quickReplies:[], clearDraft:true, clearState:true, ui:{mode:'none', awaiting:null, safeToApply:false}}, { clearState:true });
+  if (pDel) return rvContinueDeleteDraft(text, JSON.parse(JSON.stringify(pDel)), ctx);
+  if (pEdit) return rvContinueEditDraft(text, JSON.parse(JSON.stringify(pEdit)), ctx);
+  if (pInt) return rvContinueDraft(text, JSON.parse(JSON.stringify(pInt)), ctx);
+  if (rvIsDeleteInterventionIntent(text)) return rvNewDeleteDraft(text, ctx);
+  if (rvIsEditInterventionIntent(text)) return rvNewEditDraft(text, ctx);
+  return null;
+}
+
+// === Rural Vet AI intervention wizard v11: safe candidates, persistent draft ===
+function rvCleanServiceText(text) {
+  let n = norm(text);
+  n = n.replace(/\bartif\b|\bartif\.?\b|\bartific\b|\bartific\.?\b/g, 'artificiale');
+  n = n.replace(/\bfecondazioni\b/g, 'fecondazione');
+  n = n.replace(/\bfecond\b|\bfecond\.?\b|\bfec\b|\bfec\.?\b/g, 'fecondazione');
+  n = n.replace(/\bfa\b/g, 'fecondazione artificiale');
+  n = n.replace(/\beco\b/g, 'ecografia');
+  n = n.replace(/\bcesar\b|\bcesar\.?\b|\bcesario\b/g, 'cesareo');
+  n = n.replace(/\bseconda\b/g, 'successiva');
+  return n.replace(/\s+/g, ' ').trim();
+}
+function rvStripDateTime(text) {
+  return safeText(text, 4000)
+    .replace(/\b(oggi|ieri|domani|stamattina|questa mattina|mattina|pomeriggio|stasera|sera|notte)\b/ig, ' ')
+    .replace(/\b(?:alle|ore)\s*\d{1,2}(?::|\.)?\d{0,2}\b/ig, ' ')
+    .replace(/\b\d{1,2}[:.]\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}[\/.-]\d{1,2}(?:[\/.-](?:20\d{2}|\d{2}))?\b/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function rvExtractCompanyRaw(text) {
+  const raw = safeText(text, 4000).replace(/\s+/g, ' ').trim();
+  const m = raw.match(/\b(?:da|presso|cliente|azienda)\s+(.+?)(?=\s+\b(?:oggi|ieri|domani|stamattina|mattina|pomeriggio|sera|notte|alle|ore)\b|\s+\d{1,2}[:.]\d{2}\b|[.;,]|$)/i);
+  return m ? safeText(m[1].trim(), 160) : '';
+}
+function rvRemoveCompanyPart(text) {
+  return safeText(text, 4000)
+    .replace(/\b(?:da|presso|cliente|azienda)\s+(.+?)(?=\s+\b(?:oggi|ieri|domani|stamattina|mattina|pomeriggio|sera|notte|alle|ore)\b|\s+\d{1,2}[:.]\d{2}\b|[.;,]|$)/i, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function rvQtyAndRaw(part) {
+  let s = safeText(part, 300).trim();
+  s = s.replace(/^\s*(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|fatto|eseguito)\s+/i, '').trim();
+  let qty = 1;
+  const m = s.match(/^\s*(\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci|x\s*\d+)\s+/i);
+  if (m) {
+    const w = norm(m[1]).replace(/\s+/g,'');
+    qty = /^x?\d+$/.test(w) ? Number(w.replace('x','')) : (NUMBER_WORDS.get(w) || 1);
+    s = s.slice(m[0].length).trim();
+  }
+  s = s.replace(/^\s*(anche|piu|più|con|oltre a|insieme a)\s+/i, '').trim();
+  return { rawText: safeText(s, 160), qty: Math.max(1, qty || 1) };
+}
+function rvExtractServicePhrases(text, ctx) {
+  let work = rvRemoveCompanyPart(text);
+  work = rvStripDateTime(work);
+  work = work.replace(/^\s*(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|fatto|eseguito)\s+/i, '').trim();
+  // Split only on explicit separators in the user text. Do not expand with catalog candidates here.
+  const parts = work.split(/\s*(?:\+|,|;|\s+e\s+|\s+piu\s+|\s+più\s+|\s+insieme a\s+|\s+oltre a\s+)\s*/i)
+    .map(rvQtyAndRaw)
+    .filter(x => x.rawText && x.rawText.length > 1 && !/^da\s+/i.test(x.rawText));
+  return parts;
+}
+function rvServiceCandidates(rawText, services) {
+  const q = rvCleanServiceText(rawText);
+  if (!q) return [];
+  const scored = services.map(s => {
+    const sn = rvCleanServiceText(s.nome);
+    let score = tokenScore(q, sn, { strong: true });
+    if (q === sn) score += 80;
+    if (sn.includes(q) && q.length > 2) score += 55;
+    if (q.includes(sn) && sn.length > 2) score += 35;
+    if (/fecondazione/.test(q) && /fecondazione|inseminazione/.test(sn)) score += 20;
+    if (/artificiale/.test(q) && /artificiale|artif/.test(sn)) score += 25;
+    if (/prima/.test(q) && /prima/.test(sn)) score += 35;
+    if (/successiva/.test(q) && /successiva|seconda/.test(sn)) score += 35;
+    if (/parto/.test(q) && /parto/.test(sn)) score += 35;
+    if (/cesareo/.test(q) && /cesareo/.test(sn)) score += 35;
+    return { id: s.id, name: s.nome, nome: s.nome, price: s.price, score };
+  }).filter(x => x.score >= 55).sort((a,b)=>b.score-a.score || String(a.name).localeCompare(String(b.name),'it'));
+  return scored.slice(0, 8);
+}
+function rvCompanyLabel(c) { return [c.nome, c.comune || c.provincia].filter(Boolean).join(' · '); }
+function rvCompanyCandidates(rawText, companies) {
+  const q = norm(rawText);
+  if (!q) return [];
+  const qTokens = meaningfulTokens(q);
+  const scored = companies.map(c => {
+    let score = scoreCompany(q, c);
+    const names = [c.nome, c.ragioneSociale, c.comune, c.provincia, c.indirizzo, c.piva, c.cf, c.tel, c.email].filter(Boolean).map(norm);
+    for (const field of names) {
+      const toks = meaningfulTokens(field);
+      for (const qt of qTokens) for (const tt of toks) {
+        if (qt.length >= 3 && tt.length >= 3) {
+          const d = levenshtein(qt, tt);
+          if (d <= 1) score = Math.max(score, 70);
+          else if (d <= 2 && Math.max(qt.length, tt.length) >= 5) score = Math.max(score, 58);
+          if (tt.startsWith(qt) || qt.startsWith(tt)) score = Math.max(score, 65);
+        }
+      }
+    }
+    return { id: c.id, name: c.nome, nome: c.nome, label: rvCompanyLabel(c), company: c, score };
+  })
+    .filter(x => x.score >= 10)
+    .sort((a,b)=>b.score-a.score || String(a.name).localeCompare(String(b.name),'it'));
+  return scored.slice(0, 8);
+}
+function rvIsCreateInterventionIntent(text, ctx) {
+  const n = rvCleanServiceText(text);
+  if (/\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti)\b/.test(n) && ctx.services.some(s => rvServiceCandidates(safeText(text,200), [s]).length)) return true;
+  if (/\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti)\b/.test(n) && /\b(fecondazione|inseminazione|parto|cesareo|visita|ecografia|mastite|metrite|terapia)\b/.test(n)) return true;
+  if (/\b(\d+|un|uno|una|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\b/.test(n) && /\b(fecondazione|inseminazione|parto|cesareo|visita|ecografia|mastite|metrite|terapia)\b/.test(n)) return true;
+  if (/\bda\b/.test(n) && /\b(fecondazione|inseminazione|parto|cesareo|visita|ecografia|mastite|metrite|terapia)\b/.test(n)) return true;
+  return false;
+}
+
+function rvNewDraft(text, ctx) {
+  const when = parseWhen(text, ctx.now);
+  const companyRaw = rvExtractCompanyRaw(text);
+  const services = rvExtractServicePhrases(text, ctx).map(x => ({ rawText: x.rawText, qty: x.qty, serviceId: null, serviceName: null, candidates: [], status: 'unresolved' }));
+  return { type: 'intervention_draft', aiSessionId: ctx.raw?.aiSessionId || '', draftId: 'draft_' + Date.now() + '_' + Math.random().toString(36).slice(2,7), originalText: safeText(text, 500), messages: [safeText(text, 500)], services, companyRaw, companyId: null, companyName: null, companyCandidates: [], date: when.date || '', time: when.time || '', session: when.session || '', note: '', awaiting: null, currentServiceIndex: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+}
+function rvDraftResponse(reply, draft, quickReplies = [], extra = {}) {
+  return rvWithState({ reply, action: { type: 'intervention_draft', draft }, actions: [], learn: [], quickReplies, ui: { mode: 'intervention_wizard', awaiting: draft.awaiting || null, draftId: draft.draftId, safeToApply: false }, ...extra }, { pendingInterventionDraft: draft });
+}
+function rvResolveDraft(draft, ctx) {
+  draft.services = asArray(draft.services).filter(s => s && s.rawText);
+  if (!draft.services.length) {
+    draft.awaiting = 'service_choice';
+    return rvDraftResponse('Quale prestazione vuoi inserire?', draft, ['Scegli da listino','Annulla']);
+  }
+  for (let i=0;i<draft.services.length;i++) {
+    const s = draft.services[i];
+    if (s.serviceId && s.status === 'resolved') continue;
+    const cands = rvServiceCandidates(s.rawText, ctx.services);
+    s.candidates = cands;
+    const top = cands[0], second = cands[1];
+    const exact = top && rvCleanServiceText(top.name) === rvCleanServiceText(s.rawText);
+    const clear = top && (exact || (!second && top.score >= 90) || (top.score >= 135 && (!second || top.score - second.score >= 18)));
+    if (clear) { s.serviceId = top.id; s.serviceName = top.name; s.status = 'resolved'; continue; }
+    draft.currentServiceIndex = i;
+    draft.awaiting = 'service_choice';
+    if (!cands.length) return rvDraftResponse(`Non trovo una prestazione sicura per “${s.rawText}”.`, draft, ['Scegli da listino','Cerca meglio','Annulla']);
+    return rvDraftResponse(`Quale prestazione vuoi usare per “${s.rawText}”?`, draft, cands.map(x=>x.name).concat(['Cerca meglio','Annulla']));
+  }
+  if (!draft.companyId) {
+    if (draft.companyRaw) {
+      const cands = rvCompanyCandidates(draft.companyRaw, ctx.companies);
+      draft.companyCandidates = cands;
+      const top = cands[0], second = cands[1];
+      const clear = top && top.score >= 85 && (!second || top.score - second.score >= 20);
+      if (clear) { draft.companyId = top.id; draft.companyName = top.name; }
+      else {
+        draft.awaiting = 'company_choice';
+        if (cands.length) return rvDraftResponse(`Quale azienda ${draft.companyRaw} intendi?`, draft, cands.map(x=>x.label).concat(['Cerca meglio','Annulla']));
+        return rvDraftResponse(`Non ho trovato una corrispondenza sicura per “${draft.companyRaw}”.`, draft, ['Cerca meglio','Crea nuova azienda','Annulla']);
+      }
+    } else {
+      draft.awaiting = 'company_choice';
+      return rvDraftResponse('Per quale azienda?', draft, ['Cerca azienda','Annulla']);
+    }
+  }
+  if (!draft.date || (!draft.time && !draft.session)) {
+    draft.awaiting = 'datetime_choice';
+    return rvDraftResponse('Quando lo registro?', draft, ['ADESSO','oggi 14:30','ieri 09:00','Solo mattina','Solo pomeriggio','Annulla']);
+  }
+  const action = rvFinalAction(draft, ctx);
+  draft.awaiting = 'confirm';
+  const lines = action.services.map(s => `- ${s.name} x${s.qty}`);
+  return rvWithState({ reply: `Ho preparato l’intervento:\n- Azienda: ${action.companyName}\n- Prestazioni:\n${lines.join('\\n')}\n- Data/ora: ${action.date}${action.time ? ' ' + action.time : ''}\n\nVuoi salvarlo?`, action, actions: [], learn: [], quickReplies: ['SALVA','Modifica prestazioni','Modifica azienda','Modifica data/ora','Aggiungi nota','Annulla'], ui: { mode: 'intervention_wizard', awaiting: 'confirm', draftId: draft.draftId, safeToApply: true } }, { pendingInterventionDraft: draft });
+}
+function rvFinalAction(draft, ctx) {
+  const company = ctx.companies.find(c => String(c.id) === String(draft.companyId));
+  const services = asArray(draft.services).filter(s => s.serviceId && s.status === 'resolved').map(s => {
+    const svc = ctx.services.find(p => String(p.id) === String(s.serviceId));
+    return { id: svc?.id ?? s.serviceId, name: svc?.nome || s.serviceName, qty: Math.max(1, num(s.qty, 1)) };
+  });
+  return { type: 'create_intervention', companyId: company?.id || draft.companyId, companyName: company?.nome || draft.companyName, services, date: draft.date, time: draft.time, session: draft.session || sessionFromText('', draft.time), note: draft.note || 'Preparato da Rural Vet AI' };
+}
+function rvContinueDraft(text, draft, ctx) {
+  const input = safeText(text, 500).trim();
+  const n = norm(input);
+  draft.messages = asArray(draft.messages).concat([input]).slice(-20);
+  draft.updatedAt = new Date().toISOString();
+  if (/^(annulla|cancella|stop|reset)$/i.test(input)) return rvWithState({ reply: 'Ok, ho annullato la bozza intervento.', action: null, actions: [], learn: [], quickReplies: [], clearDraft: true, clearState: true, ui: { mode:'none', awaiting:null, draftId:draft.draftId, safeToApply:false } }, { clearState: true });
+  if (draft.awaiting === 'confirm') {
+    if (/^modifica prestazioni?$/i.test(input)) { draft.services.forEach(s => { s.serviceId=null; s.serviceName=null; s.status='unresolved'; }); draft.currentServiceIndex = 0; return rvResolveDraft(draft, ctx); }
+    if (/^modifica azienda$/i.test(input)) { draft.companyId=null; draft.companyName=''; draft.companyCandidates=[]; draft.awaiting='company_choice'; return rvResolveDraft(draft, ctx); }
+    if (/^modifica data\/?ora$|^modifica data$|^modifica ora$/i.test(input)) { draft.date=''; draft.time=''; draft.session=''; return rvResolveDraft(draft, ctx); }
+    if (/^aggiungi nota/i.test(input)) { draft.awaiting='note_choice'; return rvDraftResponse('Che nota vuoi aggiungere?', draft, ['Annulla']); }
+  }
+  if (draft.awaiting === 'note_choice') { draft.note = [draft.note, input.replace(/^nota\s*/i,'')].filter(Boolean).join(' '); return rvResolveDraft(draft, ctx); }
+  if (draft.awaiting === 'service_choice') {
+    const idx = Math.max(0, Number(draft.currentServiceIndex || 0));
+    const s = draft.services[idx];
+    const chosen = asArray(s?.candidates).find(c => norm(c.name) === n || n.includes(norm(c.name)) || norm(c.name).includes(n));
+    if (chosen && s) { s.serviceId = chosen.id; s.serviceName = chosen.name; s.status = 'resolved'; return rvResolveDraft(draft, ctx); }
+    // If the user typed extra information instead of choosing, merge it into the draft.
+  }
+  if (draft.awaiting === 'company_choice') {
+    const chosen = asArray(draft.companyCandidates).find(c => norm(c.label) === n || norm(c.name) === n || n.includes(norm(c.name)));
+    if (chosen) { draft.companyId = chosen.id; draft.companyName = chosen.name; return rvResolveDraft(draft, ctx); }
+    const cRaw = rvExtractCompanyRaw(input) || input;
+    if (cRaw && !/^(cerca meglio|crea nuova azienda)$/i.test(input)) draft.companyRaw = cRaw;
+  }
+  if (draft.awaiting === 'datetime_choice' || /\b(adesso|oggi|ieri|domani|alle|ore|mattina|pomeriggio|sera|notte)\b/.test(n)) {
+    let when = parseWhen(input, ctx.now);
+    if (/^solo mattina$/i.test(input)) when = { date: draft.date || isoDate(ctx.now), time: '', session: 'm', explicit: true };
+    if (/^solo pomeriggio$/i.test(input)) when = { date: draft.date || isoDate(ctx.now), time: '', session: 'p', explicit: true };
+    if (when.date) draft.date = when.date;
+    if (when.time) draft.time = when.time;
+    if (when.session) draft.session = when.session;
+  }
+  const addedServices = (/\b(aggiungi anche|anche|piu|più|con)\b/.test(n) || (draft.awaiting === 'confirm' && rvIsCreateInterventionIntent('aggiungi '+input, ctx))) ? rvExtractServicePhrases(input, ctx) : [];
+  for (const x of addedServices) draft.services.push({ rawText: x.rawText, qty: x.qty, serviceId: null, serviceName: null, candidates: [], status: 'unresolved' });
+  const cRaw = rvExtractCompanyRaw(input);
+  if (cRaw) draft.companyRaw = cRaw;
+  return rvResolveDraft(draft, ctx);
+}
+function rvCreateInterventionRequest(text, ctx) {
+  const pending = rvFreshDraft(ctx.raw?.pendingInterventionDraft || ctx.raw?.pendingDraft, ctx.raw?.aiSessionId || '');
+  if (pending && pending.type === 'intervention_draft') return rvContinueDraft(text, JSON.parse(JSON.stringify(pending)), ctx);
+  if (!rvIsCreateInterventionIntent(text, ctx)) return null;
+  const draft = rvNewDraft(text, ctx);
+  return rvResolveDraft(draft, ctx);
+}
+
+function deterministicRouter(text, ctx) {
+  const priority = rvPendingOrPriority(text, ctx);
+  if (priority) return priority;
+  const handlers = [managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, rvCreateInterventionRequest, clientLookup, countClients, serviceLookup, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery, updateInterventionRequest, deleteInterventionRequest];
   for (const h of handlers) {
     const ans = h(text, ctx);
     if (ans) return ans;
@@ -1384,7 +1455,7 @@ function executePlan(plan, text, ctx) {
   if (intent === 'intervention_query') return interventionQuery(pText + ' interventi riepilogo', ctx);
   if (intent === 'revenue_query' || intent === 'invoice_query' || intent === 'analytics_query') return analyticsQuery(pText + ' fatturato ricavi fatture analisi', ctx) || revenueQuery(pText + ' fatturato ricavi fatture', ctx);
   if (intent === 'km_query') return kmQuery(pText + ' km', ctx);
-  if (intent === 'create_intervention') return createInterventionRequest(text, ctx);
+  if (intent === 'create_intervention') return rvCreateInterventionRequest(text, ctx);
   if (intent === 'update_intervention') return updateInterventionRequest(text, ctx);
   if (intent === 'delete_intervention') return deleteInterventionRequest(text, ctx);
   if (intent === 'create_client') return createClientRequest(text, ctx);
@@ -1498,7 +1569,7 @@ app.post('/api/vet-ai-chat', async (req, res) => {
     }
 
     result = validateAction(result, ctx);
-    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || null, clearDraft: !!result.clearDraft, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
+    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || null, state: result.state || null, clearDraft: !!result.clearDraft, clearState: !!result.clearState, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
     res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
@@ -1510,7 +1581,5 @@ app.post(['/api/ai', '/api/chat'], (req, res, next) => {
   app._router.handle(req, res, next);
 });
 
-if (process.env.RURAL_VET_NO_LISTEN !== '1') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
-
-export { buildContext, deterministicRouter, analyticsQuery, companyInfoQuery, continueAnalyticsQuery, parseAnalyticsQuery, parseAnalyticsPeriod, findCompanyCandidates, findServiceCandidates, buildAnalyticsReply, normalizeCompany, normalizeService, normalizeIntervention, normalizeInvoice, euro };
-
+if (!process.env.RV_AI_TEST) app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
+export { buildContext, deterministicRouter, rvCreateInterventionRequest, rvExtractServicePhrases, rvServiceCandidates, rvCompanyCandidates, rvResolveDraft, rvContinueDraft, rvInterventionCandidates, rvNewEditDraft, rvNewDeleteDraft, rvPendingOrPriority, parsePeriod, analyticsQuery };
