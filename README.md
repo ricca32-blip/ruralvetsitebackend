@@ -195,3 +195,52 @@ Endpoint chat usato dal frontend:
 ## Nota importante
 
 L'obiettivo di questa versione e coprire il piu possibile le modifiche umane del gestionale tramite chat. Per sicurezza, le azioni che cambiano dati vengono sempre trasformate in una proposta strutturata e applicate solo dopo `SALVA` o `ELIMINA`.
+
+## Rural Vet AI - riepiloghi dashboard e analytics
+
+La AI ora include un motore deterministico per domande economiche e operative. I numeri vengono calcolati dal backend sui dati reali del context, non stimati da OpenAI.
+
+Esempi supportati:
+
+- `Quale azienda ha fatto maggiori ricavi da inizio anno?`
+- `Quanto ha fatturato Rossi da inizio anno?`
+- `Quanto ha fatturato l'azienda X nell'ultimo mese?`
+- `Qual è lo spaccato per prestazione dei ricavi ultimo mese?`
+- `Quante fecondazioni ho fatto questo mese?`
+- `Quanto devo ancora fatturare da Rossi?`
+- `Quanto ho incassato questo mese?`
+
+Se il nome azienda o prestazione è ambiguo, il backend restituisce bottoni di scelta e il frontend mantiene `pendingAnalyticsQuery` per completare la query al click successivo.
+
+Controllo pre-deploy consigliato:
+
+```bash
+node --check server.js
+node --check test-ai-flow.js
+node test-ai-flow.js
+```
+
+## Rural Vet AI - dashboard avanzata e anagrafica aziende
+
+La AI ora supporta anche interrogazioni piu avanzate sui dati della dashboard e sulle anagrafiche aziendali.
+
+Esempi:
+
+- `Quale azienda ha maggiori ricavi la scorsa settimana?`
+- `Quale azienda ha maggiori ricavi questo mese?`
+- `Quali servizi sono i piu venduti questo mese?`
+- `Spaccato % ricavi per servizio ultimo mese`
+- `Quanto ha fatturato Rossi da inizio anno?`
+- `PIVA di Rossi`
+- `telefono di rosi`
+- `indirizzo azienda Verdi`
+
+Regole implementate:
+
+- i ricavi sono calcolati dagli interventi;
+- il fatturato e calcolato dalle fatture;
+- l'incassato usa fatture pagate/pagamenti disponibili;
+- i servizi piu venduti mostrano quantita, ricavi e percentuale sul totale;
+- se l'azienda e ambigua, vengono proposti bottoni con aziende simili;
+- le domande anagrafiche usano gli stessi bottoni di scelta azienda;
+- i numeri non vengono inventati da OpenAI.
