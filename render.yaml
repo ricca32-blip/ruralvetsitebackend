@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: rural-vet-ai
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: ALLOWED_ORIGIN
+        value: "*"
+      - key: OPENAI_API_KEY
+        sync: false
