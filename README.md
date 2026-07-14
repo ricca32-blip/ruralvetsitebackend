@@ -1,5 +1,108 @@
 # Rural Vet AI backend + gestionale v8
 
+## v8.12 - Incolla e basta + AI blindata per ogni evenienza
+
+Versione **8.12.0**. Pensata per il deploy "copia-incolla": **bastano 2 file**, nessun'altra modifica.
+
+### Deploy in 2 mosse (zero configurazione aggiuntiva)
+
+1. **Repo del sito (GitHub Pages)** → incolla `index.html` al posto del vecchio. Fine.
+2. **Repo del backend (Render)** → incolla `server.js` al posto del vecchio. Fine. Funziona col `package.json` già presente nel repo backend (stesse dipendenze, nessuna nuova) e con qualsiasi Node: su Node <18 il proxy cloud si disattiva da solo senza rompere nulla.
+
+Tutto il resto (test, render.yaml, .env.example, README) è **facoltativo**: migliora il repo ma non serve per far funzionare l'app. Anche le variabili `JSONBIN_*` restano opzionali: senza, il salvataggio usa il canale attuale; quando le imposterai, il frontend passerà da solo al canale sicuro. Idem `OPENAI_API_KEY`: senza chiave il gestionale funziona comunque al 100% (vedi sotto).
+
+### AI blindata per ogni evenienza
+
+- **Domande cliniche mai più scambiate per inserimenti**: "Come si cura la mastite in una frisona?" o "Che terapia consigli per una metrite?" non aprono più il wizard intervento (bug reale trovato nei test): vanno alla risposta veterinaria. Gli inserimenti espliciti ("Ho fatto…", "Registra…") restano wizard.
+- **Funziona anche senza OpenAI**: se manca `OPENAI_API_KEY` o OpenAI è giù, le domande libere ricevono una risposta chiara con bottoni verso tutto ciò che funziona offline (cockpit, KPI, interventi) — mai più "manca OPENAI_API_KEY su Render" secco. Router deterministico, KPI, grafici, wizard e fatture non dipendono da OpenAI.
+- **Small talk offline**: "Ciao", "Grazie", "Chi sei?" ricevono risposta immediata con azioni suggerite; "ciao, quanti ricavi oggi?" risponde coi dati, non col saluto.
+- **Comprensione più larga**: sinonimi economici ("quanto ho guadagnato", "incasso", "entrate"), date "dopodomani" e "altroieri".
+- **Riprova con un tap**: se la rete o il backend falliscono, sotto il messaggio d'errore compare un bottone "Riprova" che ritrasmette l'ultima richiesta.
+
+### Test nuovi
+
+Small talk (incluso il caso misto saluto+dati), sinonimi, dopodomani, guardia anti-wizard sulle domande cliniche (2 casi + controprova inserimento esplicito), degradazione senza chiave OpenAI chiamando davvero l'endpoint `/api/vet-ai-chat`.
+
+## v8.11 - Interfaccia Rural Vet AI ridisegnata
+
+Versione **8.11.0**. Redesign professionale della chat Rural Vet AI (patch additiva `rv-v811-ai-pro`): la logica dei flussi non è stata toccata, cambia come l'informazione viene presentata.
+
+### Cosa vedi di diverso
+
+- **Design system a token** (colori, raggi, ombre, spaziature coerenti) con palette petrolio/verde già introdotta in v8.8, numeri tabellari per gli importi.
+- **Messaggi strutturati invece del testo piatto**: titolo con periodo/ambito separato ("Riepilogo economico · oggi"), righe KPI come card, classifiche con badge numerati, importi/percentuali/KM evidenziati (negativi in rosso), domande finali come suggerimento discreto, SALVA/ELIMINA resi come tasti (ELIMINA in rosso). Il testo è sanificato: nessun HTML del backend viene mai iniettato (test XSS incluso).
+- **Header con stato reale**: pallino verde/rosso e versione del backend (ping su `/api/health`, aggiornato max ogni 30s).
+- **Quick replies ripensate**: chips scorrevoli in orizzontale su mobile, SALVA verde, ELIMINA rosso, Annulla tratteggiato.
+- **Copia messaggio** al passaggio del mouse, **scroll-to-bottom** quando risali la conversazione, composer con focus ring, etichetta "Rural Vet AI" solo sul primo messaggio di un gruppo consecutivo (meno rumore).
+- Rispetto di `prefers-reduced-motion`, `aria-label` sulle nuove azioni.
+
+### Come è fatto (per chi mette le mani nel codice)
+
+Il renderer esistente produce i nodi; la patch li **decora** via `MutationObserver` in modo idempotente (`data-rv-pro`). Il formatter è una funzione pura esposta come `window.__rvAiProTest.formatMessage` e coperta da test (titolo+scope, elenchi, classifica, importi, kbd, XSS, negativi).
+
+## v8.10 - Rural Vet AI più capace e UX rifinita
+
+Versione **8.10.0** (include tutta la v8.9 qui sotto).
+
+### Rural Vet AI
+
+- **"Cambia il cesareo di Rossi in visita clinica" ora funziona**: sostituzione puntuale di una singola prestazione (quantità preservata; se la prestazione di destinazione è già presente, le quantità si sommano). L'AI considera solo gli interventi che contengono la prestazione da sostituire.
+- **Riepiloghi delle modifiche in italiano**: "Ora: 16:30 · Sessione: pomeriggio · Fatturato: sì" invece di "time: 16:30 · fatt: true".
+- **Niente false modifiche**: se chiedi di segnare come fatturato un intervento già fatturato, l'AI risponde "È già così" invece di proporre un salvataggio inutile; "di ieri" usato solo per individuare l'intervento non compare più come cambio di data.
+
+### UX / UI (patch additiva `rv-v810-ux`, nessun layout stravolto)
+
+- **Annulla eliminazione**: dopo aver eliminato un intervento compare per 6 secondi un toast con "Annulla" che lo ripristina (tombstone rimosso e ripristino che vince anche nel merge multi-dispositivo).
+- **Toast non bloccanti** per esiti e errori di salvataggio cloud (con promemoria che i dati restano nella copia locale), `aria-live` per gli screen reader.
+- **Guardia anti doppio click** generalizzata sui bottoni delle modali e sui bottoni distruttivi.
+- **Mobile**: bottoni con area di tocco ≥46px, tabelle scorrevoli in orizzontale con intestazione fissa, input a 16px per evitare lo zoom automatico di iOS.
+- **Tastiera e accessibilità**: ESC chiude le modali (con sblocco dello scroll), focus visibile su bottoni e campi, ruoli ARIA su navigazione e dialog.
+
+### Test aggiunti
+
+- Sostituzione prestazione end-to-end (ids e etichetta), riconoscimento no-op, annulla-eliminazione eseguita davvero in sandbox (eliminazione → tombstone → ripristino → updatedAt).
+
+## v8.9 - Sync cloud sicuro, merge multi-dispositivo e fix router
+
+Versione **8.9.0**. Focus: integrità e sicurezza dei dati, senza toccare l'esperienza d'uso.
+
+### Cosa cambia
+
+1. **La chiave JSONBin esce dall'HTML.** Nuovi endpoint backend `/api/db/ping`, `/api/db/load`, `/api/db/save`: il gestionale salva e carica passando dal backend, che tiene `JSONBIN_BIN_ID` e `JSONBIN_API_KEY` in variabili ambiente. Se il backend non è ancora configurato, il frontend torna da solo al vecchio canale diretto: **nulla si rompe** nel frattempo.
+2. **Merge multi-dispositivo con timestamp per record.** Prima, a parità di id vinceva sempre la copia locale (anche se non toccata), sovrascrivendo in silenzio le modifiche fatte da un altro dispositivo. Ora ogni record realmente modificato viene marcato con `updatedAt` e nel merge vince il più recente. Le eliminazioni (tombstone) restano rispettate. Senza timestamp il comportamento resta quello storico.
+3. **Guardia fatture**: niente fatture vuote (0 interventi) e niente doppia emissione da doppio click, che consumava un numero progressivo.
+4. **Fix router Rural Vet AI**: "Km percorsi oggi" non viene più dirottata su "Non trovo quel cliente"; "P.IVA di Rossi" risponde con la P.IVA e non col riepilogo economico; il backend accetta anche `context.interventions` come alias.
+5. **Igiene progetto**: `package.json` con script `check`/`test`, `.env.example`, `.gitignore`, `render.yaml` aggiornato (health check + env del proxy), limite JSON ridotto da 60mb a 12mb (configurabile con `JSON_LIMIT`).
+6. **Test veri**: `test-ai-flow.js` ora, oltre ai controlli statici, esegue davvero il router con dati finti (KPI con cifre attese esatte, KM, P.IVA, wizard intervento con `safeToApply`, sicurezza eliminazioni), esegue il codice del merge in sandbox (6 casi) e chiama gli endpoint `/api/db/*` senza rete.
+
+### Deploy v8.9 (una volta sola, ~5 minuti)
+
+1. Commit e push dei file su GitHub (vedi messaggio di commit sotto). Render fa il deploy da solo (`autoDeploy: true`).
+2. Su **jsonbin.io** genera una **nuova master key** (la vecchia, essendo stata dentro l'HTML pubblico, è da considerare compromessa).
+3. Su **Render → Environment** compila `JSONBIN_BIN_ID` (l'id del bin attuale) e `JSONBIN_API_KEY` (la nuova chiave). Con il `render.yaml` aggiornato i due campi vengono richiesti automaticamente.
+4. Fine: al prossimo caricamento il gestionale rileva il backend configurato (`/api/db/ping`) e passa da solo al canale sicuro. Nessuna modifica a mano al codice.
+5. Solo dopo aver verificato un salvataggio riuscito ("✓ Salvato" senza "(canale diretto)"), **elimina la vecchia chiave** su jsonbin.io.
+
+### Verifica prima del deploy
+
+```bash
+npm install
+npm test
+```
+
+### Messaggio di commit consigliato
+
+```txt
+v8.9: sync cloud via backend (chiave fuori dall'HTML), merge multi-dispositivo con timestamp, guardia fatture, fix router KM/P.IVA, test funzionali
+```
+
+### Limiti noti e trasparenti
+
+- Finché la vecchia chiave JSONBin non viene ruotata, resta tecnicamente utilizzabile da chi ha il vecchio HTML: la rotazione (passo 2-5) è la parte che chiude davvero la falla.
+- Il login profili resta cosmetico (password nel client): protezione da uso improprio, non da un attaccante. Una autenticazione vera è candidata per la v9.
+- L'endpoint AI resta aperto (CORS `*`): valuta di impostare `ALLOWED_ORIGIN` all'origine GitHub Pages del frontend.
+
+
 Versione **8.0.0**. Questa release rende Rural Vet AI molto piu gestionale-first: prima legge e calcola sui dati reali del gestionale, poi usa OpenAI solo quando serve interpretare meglio la richiesta o rispondere a domande cliniche.
 
 ## Cosa puo fare da chat

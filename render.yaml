@@ -5,6 +5,7 @@ services:
     buildCommand: npm install
     startCommand: npm start
     autoDeploy: true
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: 20.11.1
@@ -13,4 +14,11 @@ services:
       - key: ALLOWED_ORIGIN
         value: "*"
       - key: OPENAI_API_KEY
+        sync: false
+      # v8.9 — sync cloud sicuro: Render ti chiederà questi due valori al deploy.
+      # Copia binId e (nuova) master key da jsonbin.io, poi RUOTA la vecchia chiave:
+      # quella incorporata nell'HTML storico è da considerare compromessa.
+      - key: JSONBIN_BIN_ID
+        sync: false
+      - key: JSONBIN_API_KEY
         sync: false

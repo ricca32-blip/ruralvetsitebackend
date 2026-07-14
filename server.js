@@ -10,12 +10,12 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 9000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 24000);
-const VERSION = '8.8.0-rural-vet-ai-ui-compact';
+const VERSION = '8.12.0-paste-and-go-ai-hardening';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' });
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(express.json({ limit: '60mb' }));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '12mb' }));
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN.split(',').map(s => s.trim()) }));
 app.options('*', cors());
 app.use((req, res, next) => {
@@ -112,6 +112,8 @@ function parseItalianDate(text, now = new Date()) {
     return `${y}-${pad2(m[2])}-${pad2(m[1])}`;
   }
   if (/\boggi\b/.test(n)) return isoDate(now);
+  if (/\bdopodomani\b|\bdopo domani\b/.test(n)) return isoDate(addDays(now, 2));
+  if (/\baltroieri\b|\baltro ieri\b|\bl altro ieri\b/.test(n)) return isoDate(addDays(now, -2));
   if (/\bieri\b/.test(n)) return isoDate(addDays(now, -1));
   if (/\bdomani\b/.test(n)) return isoDate(addDays(now, 1));
   for (const [name, idx] of MONTHS) {
@@ -282,7 +284,7 @@ function normalizeIntervention(raw, ctx) {
   };
 }
 function compactInterventions(context = {}, ctx) {
-  const raw = [...asArray(context.interventi), ...asArray(context.interventiRecenti), ...asArray(context.activities), ...asArray(context.int)];
+  const raw = [...asArray(context.interventi), ...asArray(context.interventiRecenti), ...asArray(context.activities), ...asArray(context.interventions), ...asArray(context.int)];
   return uniqueBy(raw.map(x => normalizeIntervention(x, ctx)).filter(Boolean), i => String(i.id || [i.data, i.ora, i.azienda, i.userName, i.prestazioni.map(p => p.nome).join(',')].join('|'))).slice(0, 8000);
 }
 function normalizeInvoice(raw, ctx) {
@@ -446,7 +448,7 @@ function qtyNearService(text, serviceName) {
 function requestedFields(text) {
   const n = norm(text);
   const fields = [];
-  if (/\bpiva\b|\bpartita iva\b/.test(n)) fields.push('piva');
+  if (/\bpiva\b|\bp iva\b|\bpartita iva\b/.test(n)) fields.push('piva');
   if (/\bcodice fiscale\b|\bcf\b/.test(n)) fields.push('cf');
   if (/\bsdi\b|\bcodice destinatario\b/.test(n)) fields.push('sdi');
   if (/\bragione sociale\b|\brag sociale\b/.test(n)) fields.push('ragioneSociale');
@@ -526,6 +528,26 @@ function formatInvoice(f) {
 function isHelpRequest(text) {
   const n = norm(text);
   return /\b(cosa puoi fare|aiuto|help|comandi|funzioni|come posso|cosa sai fare|manuale ai)\b/.test(n);
+}
+function smallTalkQuery(text, ctx) {
+  const n = norm(text);
+  // Solo se il messaggio è DAVVERO small talk: corto e senza richieste gestionali ("ciao, ricavi oggi?" passa oltre)
+  if (n.length > 40 || looksManagement(text)) return null;
+  const name = ctx.currentUser?.name ? ' ' + String(ctx.currentUser.name).split(' ')[0] : '';
+  const qr = ['Cockpit Rural Vet AI', 'Inserisci intervento', 'Grafico ricavi', 'Chiusura giornata'];
+  if (/^(ciao|salve|hey|ehi|buongiorno|buonasera|buon pomeriggio|bella|we|hola)[\s!.,]*$/.test(n)) {
+    return response(`Ciao${name}. Dimmi cosa ti serve: un dato del gestionale, un grafico o l'inserimento di un intervento.`, null, qr);
+  }
+  if (/^(grazie|grazie mille|top|perfetto|ottimo|ok grazie|bene grazie)[\s!.,]*$/.test(n)) {
+    return response('Di nulla. Se ti serve altro sono qui.', null, qr);
+  }
+  if (/^(chi sei|cosa sei|come ti chiami|presentati)[\s?.,!]*$/.test(n)) {
+    return response('Sono Rural Vet AI, il copilota del tuo gestionale: lavoro solo sui dati reali che vedi nelle sezioni (interventi, clienti, listino, fatture, km). Non invento mai numeri e non modifico nulla senza il tuo SALVA o ELIMINA.', null, qr);
+  }
+  if (/^(come va|tutto bene|come stai)[\s?.,!]*$/.test(n)) {
+    return response('Tutto operativo. Vuoi il cockpit della giornata o un dato preciso?', null, qr);
+  }
+  return null;
 }
 function pct(part, total) { return total ? `${((num(part) / num(total)) * 100).toFixed(1).replace('.', ',')}%` : '0%'; }
 function avg(total, count) { return count ? num(total) / count : 0; }
@@ -1462,7 +1484,32 @@ function parseInterventionUpdates(text, ctx) {
     const sv = detectRequestedServices(servicePart, ctx.services, { max: 8 });
     if (sv.length) updates.services = sv.map(s => ({ id:s.id, name:s.nome || s.name, qty:s.qty || 1 }));
   }
+  // "Cambia il cesareo (di Rossi) in visita clinica" → sostituzione puntuale di una prestazione
+  if (!updates.services && !updates.companyId) {
+    const swap = safeText(text).match(/\b(?:cambia|sostituisci|trasforma|converti)\b(?:\s+(?:il|la|lo|l['’]|un[oa]?))?\s+(.+?)\s+(?:in|con)\s+(?:una?\s+|il\s+|la\s+)?(.+?)\s*$/i);
+    if (swap) {
+      const fromCands = detectRequestedServices(swap[1], ctx.services, { max: 3 });
+      const toCands = detectRequestedServices(swap[2], ctx.services, { max: 3 });
+      const from = fromCands[0], to = toCands[0];
+      if (from && to && String(from.id) !== String(to.id)) {
+        updates.replaceService = { fromId: from.id, fromName: from.nome || from.name, toId: to.id, toName: to.nome || to.name };
+      }
+    }
+  }
   return updates;
+}
+function interventionUpdateLabel(key, value, target = null) {
+  const sessName = s => ({ m:'mattina', p:'pomeriggio', n:'sera' }[String(s).toLowerCase()] || s);
+  if (key === 'date') return `Data: ${value}`;
+  if (key === 'time') return `Ora: ${value}`;
+  if (key === 'session') return `Sessione: ${sessName(value)}`;
+  if (key === 'fatt') return `Fatturato: ${value ? 'sì' : 'no'}`;
+  if (key === 'note') return `Nota: ${value}`;
+  if (key === 'companyName') return `Cliente: ${value}`;
+  if (key === 'companyId') return '';
+  if (key === 'replaceService') return `Prestazione: ${value.fromName} → ${value.toName}`;
+  if (key === 'services') return `Prestazioni: ${(Array.isArray(value) ? value : []).map(x => `${x.name || x.nome} x${x.qty || 1}`).join(', ')}`;
+  return `${key}: ${value}`;
 }
 function isUpdateInterventionRequest(text) {
   const n = norm(text);
@@ -1471,12 +1518,27 @@ function isUpdateInterventionRequest(text) {
 function updateInterventionRequest(text, ctx) {
   if (!isUpdateInterventionRequest(text)) return null;
   const filters = managementFilters(text, ctx, /\boggi\b/.test(norm(text)) ? 'today' : 'ytd');
-  const items = filterInterventions(ctx, filters).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora))).slice(0,12);
+  let items = filterInterventions(ctx, filters).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora))).slice(0,12);
   const updates = parseInterventionUpdates(text, ctx);
   if (!Object.keys(updates).length) return response('Che cosa devo cambiare dell’intervento? Posso modificare data, ora, cliente, prestazioni, note o stato fatturato.');
+  // Se è una sostituzione ("cambia il cesareo in visita clinica"), considera solo gli interventi che contengono la prestazione di partenza
+  if (updates.replaceService) {
+    const withFrom = items.filter(i => (i.prestazioni || []).some(p => String(p.id) === String(updates.replaceService.fromId)));
+    if (withFrom.length) items = withFrom;
+  }
   if (!items.length) return response(`Non trovo l'intervento da modificare per ${displayScope(filters) || periodLabel(filters.period)}. Dimmi cliente, giorno e prestazione.`);
-  const lines = Object.entries(updates).map(([k,v]) => `${k}: ${Array.isArray(v) ? v.map(x=>`${x.name || x.nome} x${x.qty || 1}`).join(', ') : v}`).join('\n');
-  if (items.length === 1) return response(`Ho preparato questa modifica:\n- ${formatIntervention(items[0])}\n${lines}\nScrivi SALVA per applicarla.`, { type:'update_intervention', interventionId:items[0].id, updates, query:text }, actionButtons('save'));
+  const summaryUpdates = { ...updates };
+  if (items.length === 1) {
+    // Non mostrare come "modifiche" i campi che coincidono già con l'intervento (es. "di ieri" usato solo per individuarlo)
+    const t = items[0];
+    if (summaryUpdates.date && String(summaryUpdates.date) === String(t.data)) delete summaryUpdates.date;
+    if (summaryUpdates.time && String(summaryUpdates.time) === String(t.ora)) delete summaryUpdates.time;
+    if (summaryUpdates.session && String(summaryUpdates.session) === String(t.sess)) delete summaryUpdates.session;
+    if (summaryUpdates.fatt !== undefined && Boolean(summaryUpdates.fatt) === Boolean(t.fatt)) delete summaryUpdates.fatt;
+    if (!Object.keys(summaryUpdates).length) return response(`L'intervento è già così:\n- ${formatIntervention(t)}\nNon c'è nulla da cambiare.`);
+  }
+  const lines = Object.entries(summaryUpdates).map(([k,v]) => interventionUpdateLabel(k, v)).filter(Boolean).join('\n');
+  if (items.length === 1) return response(`Ho preparato questa modifica:\n- ${formatIntervention(items[0])}\n${lines}\nScrivi SALVA per applicarla.`, { type:'update_intervention', interventionId:items[0].id, updates:summaryUpdates, query:text }, actionButtons('save'));
   return response(`Ho trovato più interventi possibili. Scegli il numero:\n` + items.map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), { type:'update_intervention', query:text, updates, options:items.map(i=>({interventionId:i.id})) }, []);
 }
 function settingsMutationRequest(text, ctx) {
@@ -1526,12 +1588,17 @@ function cleanJson(raw) {
 }
 
 function clientLookup(text, ctx) {
-  const fields = requestedFields(text);
+  const n = norm(text);
+  let fields = requestedFields(text);
+  // "Km percorsi oggi/questa settimana" è una domanda sui KM di viaggio, non sull'anagrafica di un cliente
+  if (fields.includes('km') && /\b(percorsi|percorso|fatti|totali|totale|rimborso|rimborsi|oggi|ieri|settimana|mese|anno|efficienza)\b/.test(n) && !/\b(cliente|azienda)\b/.test(n)) fields = fields.filter(f => f !== 'km');
   if (!fields.length) return null;
   const found = resolveCompany(text, ctx.companies);
   if (!found.match) {
     if (found.alternatives.length) return { reply: 'Ho trovato più clienti possibili:\n' + found.alternatives.map((a,i)=>`${i+1}) ${a.nome}${a.ragioneSociale ? ' · ' + a.ragioneSociale : ''}`).join('\n') + '\nQuale intendi?', action: null, actions: [], learn: [] };
-    return { reply: 'Non trovo quel cliente nel gestionale. Scrivimi il nome esatto come appare in Aziende.', action: null, actions: [], learn: [] };
+    // Rispondo "non trovato" solo se la frase parla davvero di un cliente/azienda; altrimenti lascio rispondere gli altri handler (es. kmQuery)
+    if (/\b(cliente|azienda)\b/.test(n) || /\bdi\s+[a-z]{3,}\b/.test(n)) return { reply: 'Non trovo quel cliente nel gestionale. Scrivimi il nome esatto come appare in Aziende.', action: null, actions: [], learn: [] };
+    return null;
   }
   const c = found.match;
   const lines = [];
@@ -1612,7 +1679,7 @@ function interventionQuery(text, ctx) {
 }
 function revenueQuery(text, ctx) {
   const n = norm(text);
-  if (!/\b(fatturato|fatturare|fatture|fattura|ricavi|ricavo|incassato|incassi|pagato|pagata|da pagare|non pagate|aperte|dashboard|economico|totale)\b/.test(n)) return null;
+  if (!/\b(fatturato|fatturare|fatture|fattura|ricavi|ricavo|incassato|incassi|incasso|guadagnato|guadagni|guadagno|entrate|pagato|pagata|da pagare|non pagate|aperte|dashboard|economico|totale)\b/.test(n)) return null;
   const filters = managementFilters(text, ctx, 'ytd');
   if (filters.companyResult.ambiguous) return { reply: 'Ho trovato più clienti possibili:\n' + filters.companyResult.alternatives.map((a,i)=>`${i+1}) ${a.nome}`).join('\n') + '\nQuale intendi?', action: null, actions: [], learn: [] };
   const ints = filterInterventions(ctx, filters);
@@ -1944,6 +2011,12 @@ function continuePendingInterventionDraft(userText, pendingDraft, ctx) {
 function isInterventionDraftStart(text, ctx) {
   const n = norm(text);
   if (/\b(prezzo|quanto costa|listino|piva|fattura|fatture|ricavi|top|dashboard)\b/.test(n)) return false;
+  // Domande cliniche o conoscitive NON sono inserimenti: "Come si cura la mastite?", "Che terapia consigli?"
+  const actionVerb = /\b(ho fatto|ho eseguito|abbiamo fatto|registra|inserisci|segna|aggiungi|metti)\b/.test(n);
+  if (!actionVerb) {
+    if (/\?\s*$/.test(safeText(text, 500))) return false;
+    if (/\b(come|cosa|che cosa|perche|quale|quali|quanti|quante|quanta|quanto|sintomi|sintomo|terapia|terapie|cura|curare|trattare|trattamento|dosaggio|posologia|protocollo|farmaco|farmaci|consigli|consiglio|conviene|meglio|differenza)\b/.test(n)) return false;
+  }
   if (isCreateInterventionRequest(text)) return true;
   if (/\b(\d+|un|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\s+\w+/.test(n) && extractRawServices(text, ctx).length) return true;
   return false;
@@ -1990,7 +2063,7 @@ function deleteInterventionRequest(text, ctx) {
 }
 function deterministicRouter(text, ctx) {
   if (ctx.raw?.pendingInterventionDraft?.type === 'intervention_draft') return continuePendingInterventionDraft(text, ctx.raw.pendingInterventionDraft, ctx);
-  const handlers = [managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, ruralVetAiSelfTestQuery, uploadPreflightQuery, ruralVetAiCockpitQuery, weeklyDigestQuery, performanceVeterinariQuery, kmEfficiencyQuery, dailyClosureQuery, monthProjectionQuery, auditGestionaleQuery, cashflowQuery, interventionAnomaliesQuery, listinoQualityQuery, smartSuggestionsQuery, nextActionsQuery, dataQualityQuery, inactiveClientsQuery, ruralVetAiBriefingQuery, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
+  const handlers = [smallTalkQuery, managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, ruralVetAiSelfTestQuery, uploadPreflightQuery, ruralVetAiCockpitQuery, weeklyDigestQuery, performanceVeterinariQuery, kmEfficiencyQuery, dailyClosureQuery, monthProjectionQuery, auditGestionaleQuery, cashflowQuery, interventionAnomaliesQuery, listinoQualityQuery, smartSuggestionsQuery, nextActionsQuery, dataQualityQuery, inactiveClientsQuery, ruralVetAiBriefingQuery, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
   for (const h of handlers) {
     const ans = h(text, ctx);
     if (ans) return ans;
@@ -2145,14 +2218,15 @@ function toOpenAIContent(payload, image) {
   return [ { type: 'text', text: JSON.stringify(payload) }, { type: 'image_url', image_url: { url: image.dataUrl } } ];
 }
 async function safeGeneralAnswer(body, ctx) {
+  const offlineQr = ['Cockpit Rural Vet AI', 'KPI periodo', 'Inserisci intervento', 'Aiuto'];
   if (!process.env.OPENAI_API_KEY) {
-    return { reply: 'Backend attivo, ma manca OPENAI_API_KEY su Render.', action: null, actions: [], learn: [], source: 'missing-key' };
+    return { reply: 'Per le domande libere (es. casi clinici) serve la chiave OpenAI sul backend, che ora manca. Tutte le funzioni del gestionale però funzionano lo stesso: dati, KPI, grafici, interventi, fatture. Prova con uno di questi:', action: null, actions: [], learn: [], quickReplies: offlineQr, source: 'openai-missing-key' };
   }
   try {
     return await generalAnswer(body, ctx);
   } catch (err) {
     console.error('OpenAI generalAnswer non riuscita:', err);
-    return { reply: 'Il backend è raggiungibile, ma OpenAI non ha risposto correttamente. Controlla OPENAI_API_KEY, OPENAI_MODEL e quota/limiti API su Render.', action: null, actions: [], learn: [], source: 'openai-error', error: err.message };
+    return { reply: 'Non riesco a rispondere alla domanda libera in questo momento (OpenAI non raggiungibile). Le funzioni del gestionale però funzionano: dati, KPI, grafici, interventi e fatture. Riprova tra poco oppure scegli qui sotto.', action: null, actions: [], learn: [], quickReplies: offlineQr, source: 'openai-error', error: err.message };
   }
 }
 async function generalAnswer(body, ctx) {
@@ -2196,6 +2270,57 @@ function validateAction(result, ctx) {
 
 app.get('/', (req, res) => res.json({ ok: true, name: 'Rural Vet AI backend', version: VERSION, model: MODEL }));
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'rural-vet-ai', version: VERSION, model: MODEL, time: new Date().toISOString() }));
+
+// ---------------------------------------------------------------------------
+// Cloud DB proxy (v8.9): la chiave JSONBin sta SOLO qui, in variabili ambiente.
+// Il frontend chiama questi endpoint invece di parlare direttamente con JSONBin
+// con la master key incorporata nell'HTML (grave rischio: chiunque apra il
+// sorgente della pagina potrebbe leggere/sovrascrivere/cancellare tutti i dati).
+// Env richieste su Render: JSONBIN_BIN_ID, JSONBIN_API_KEY.
+// ---------------------------------------------------------------------------
+const JSONBIN_BIN_ID = safeText(process.env.JSONBIN_BIN_ID || '', 80).trim();
+const JSONBIN_API_KEY = safeText(process.env.JSONBIN_API_KEY || '', 200).trim();
+const DB_PROXY_READY = Boolean(JSONBIN_BIN_ID && JSONBIN_API_KEY && typeof fetch === 'function');
+const MAX_DB_BYTES = Number(process.env.MAX_DB_BYTES || 8 * 1024 * 1024);
+
+function looksLikeRuralVetDb(record) {
+  return record && typeof record === 'object' && !Array.isArray(record) && Array.isArray(record.aziende) && Array.isArray(record.int) && Array.isArray(record.prest);
+}
+
+app.get('/api/db/ping', (req, res) => {
+  res.json({ ok: true, configured: DB_PROXY_READY, version: VERSION });
+});
+
+app.get('/api/db/load', async (req, res) => {
+  if (!DB_PROXY_READY) return res.status(503).json({ ok: false, error: 'Cloud DB non configurato sul backend (JSONBIN_BIN_ID / JSONBIN_API_KEY mancanti).' });
+  try {
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${encodeURIComponent(JSONBIN_BIN_ID)}/latest`, { headers: { 'X-Master-Key': JSONBIN_API_KEY } });
+    if (!r.ok) return res.status(502).json({ ok: false, error: `JSONBin load ${r.status}` });
+    const j = await r.json();
+    if (!looksLikeRuralVetDb(j?.record)) return res.status(502).json({ ok: false, error: 'Record cloud non valido o vuoto.' });
+    return res.json({ ok: true, record: j.record });
+  } catch (err) {
+    console.error('Errore /api/db/load', err);
+    return res.status(502).json({ ok: false, error: 'Cloud non raggiungibile: ' + err.message });
+  }
+});
+
+app.post('/api/db/save', async (req, res) => {
+  if (!DB_PROXY_READY) return res.status(503).json({ ok: false, error: 'Cloud DB non configurato sul backend (JSONBIN_BIN_ID / JSONBIN_API_KEY mancanti).' });
+  try {
+    const record = req.body && req.body.db ? req.body.db : req.body;
+    if (!looksLikeRuralVetDb(record)) return res.status(400).json({ ok: false, error: 'Payload non valido: mi aspetto il db Rural Vet completo (aziende/int/prest). Salvataggio rifiutato per proteggere i dati.' });
+    const body = JSON.stringify(record);
+    if (Buffer.byteLength(body, 'utf8') > MAX_DB_BYTES) return res.status(413).json({ ok: false, error: 'DB troppo grande per il salvataggio cloud.' });
+    const r = await fetch(`https://api.jsonbin.io/v3/b/${encodeURIComponent(JSONBIN_BIN_ID)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_API_KEY }, body });
+    if (!r.ok) return res.status(502).json({ ok: false, error: `JSONBin save ${r.status}` });
+    return res.json({ ok: true, savedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('Errore /api/db/save', err);
+    return res.status(502).json({ ok: false, error: 'Cloud non raggiungibile: ' + err.message });
+  }
+});
+
 app.post('/api/debug-context', (req, res) => {
   const ctx = buildContext(req.body || {});
   res.json({ ok: true, version: VERSION, counts: { users: ctx.users.length, companies: ctx.companies.length, services: ctx.services.length, interventions: ctx.interventions.length, invoices: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser, sampleCompanies: ctx.companies.slice(0, 5).map(c => c.nome), sampleServices: ctx.services.slice(0, 5).map(s => s.nome), sampleInterventions: ctx.interventions.slice(0, 3), sampleInvoices: ctx.invoices.slice(0, 3) });
@@ -2246,4 +2371,4 @@ app.post(['/api/ai', '/api/chat'], (req, res, next) => {
 
 if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
 
-export { buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates };
+export { app, buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates };
