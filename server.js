@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import OpenAI from 'openai';
+import crypto from 'node:crypto';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -10,7 +11,7 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 9000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 24000);
-const VERSION = '8.12.0-paste-and-go-ai-hardening';
+const VERSION = '9.0.0-rethink';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' });
 
@@ -148,12 +149,36 @@ function parsePeriod(text, now = new Date(), fallback = 'ytd') {
   const n = norm(raw);
   const year = now.getFullYear();
 
-  const rangeMatch = raw.match(/(?:dal|da)\s+(\d{1,2}[\/.-]\d{1,2}(?:[\/.-](?:20\d{2}|\d{2}))?)\s+(?:al|a)\s+(\d{1,2}[\/.-]\d{1,2}(?:[\/.-](?:20\d{2}|\d{2}))?)/i);
+  // Intervalli: "dal ... al ...", "tra ... e ...", anche con nomi dei mesi e mese condiviso ("tra il 3 e il 15 luglio").
+  const monthNames = MONTHS.map(m => m[0]).join('|');
+  const datePart = `(?:\\d{1,2}(?:[\\/.-]\\d{1,2}(?:[\\/.-](?:20\\d{2}|\\d{2}))?)?(?:\\s+(?:${monthNames}))?(?:\\s+20\\d{2})?)`;
+  const rangeMatch = raw.match(new RegExp(`(?:dal|da|tra)\\s+(?:il\\s+)?(${datePart})\\s+(?:al|a|e)\\s+(?:il\\s+)?(${datePart})`, 'i'));
   if (rangeMatch) {
-    const from = parseItalianDate(rangeMatch[1], now);
-    const to = parseItalianDate(rangeMatch[2], now);
-    if (from && to) return { from, to, label: `${from} - ${to}` };
+    let fromRaw = rangeMatch[1].trim(), toRaw = rangeMatch[2].trim();
+    // mese/anno condivisi: "tra il 3 e il 15 luglio 2026" → il primo eredita mese+anno del secondo
+    const tailMonth = toRaw.match(new RegExp(`(${monthNames})(?:\\s+(20\\d{2}))?`, 'i'));
+    if (/^\d{1,2}$/.test(fromRaw) && tailMonth) fromRaw = `${fromRaw} ${tailMonth[1]}${tailMonth[2] ? ' ' + tailMonth[2] : ''}`;
+    if (/^\d{1,2}[\/.-]\d{1,2}$/.test(fromRaw)) {
+      const ty = toRaw.match(/(20\d{2})/); if (ty) fromRaw = `${fromRaw}/${ty[1]}`;
+    }
+    const from = parseItalianDate(fromRaw, now);
+    const to = parseItalianDate(toRaw, now);
+    if (from && to && from <= to) return { from, to, label: `${from} - ${to}` };
+    if (from && to) return { from: to, to: from, label: `${to} - ${from}` };
   }
+  // "lunedì scorso", "martedì scorso", ...
+  const WEEKDAYS = [['domenica',0],['lunedi',1],['martedi',2],['mercoledi',3],['giovedi',4],['venerdi',5],['sabato',6]];
+  for (const [wname, widx] of WEEKDAYS) {
+    if (new RegExp(`\\b${wname}\\s+scors[oa]\\b`).test(n)) {
+      let d = addDays(now, -1);
+      for (let k = 0; k < 8; k++) { if (d.getDay() === widx) break; d = addDays(d, -1); }
+      return { from: isoDate(d), to: isoDate(d), label: `${wname} scorso` };
+    }
+  }
+  if (/\baltroieri\b|\baltro ieri\b|\bl altro ieri\b/.test(n)) { const d = addDays(now, -2); return { from: isoDate(d), to: isoDate(d), label: 'altroieri' }; }
+  let mm2 = n.match(/\bultim[ioe]?\s+(\d+)\s+mes/);
+  if (mm2) { const from = new Date(now.getFullYear(), now.getMonth() - Number(mm2[1]) + 1, 1); return { from: isoDate(from), to: isoDate(now), label: `ultimi ${mm2[1]} mesi` }; }
+  if (/\bultima settimana\b/.test(n)) return { from: isoDate(addDays(now, -6)), to: isoDate(now), label: 'ultimi 7 giorni' };
   if (/\boggi\b/.test(n)) return { from: isoDate(now), to: isoDate(now), label: 'oggi' };
   if (/\bieri\b/.test(n)) { const d = addDays(now, -1); return { from: isoDate(d), to: isoDate(d), label: 'ieri' }; }
   if (/\bdomani\b/.test(n)) { const d = addDays(now, 1); return { from: isoDate(d), to: isoDate(d), label: 'domani' }; }
@@ -326,23 +351,31 @@ function compactKm(context = {}) {
     aziendaId: k.aziendaId ?? k.allId ?? k.companyId ?? k.clientId ?? k.azId,
     azienda: safeText(k.azienda ?? k.companyName ?? k.cliente ?? k.to ?? k.a, 220),
     km: num(k.km ?? k.distance, 0),
-    amount: num(k.amount ?? k.rimborso, 0)
-  })).slice(0, 5000);
+    amount: num(k.amount ?? k.rimborso, 0),
+    sess: safeText(k.sess ?? k.sessione, 10),
+    method: safeText(k.method ?? k.fonte, 40) || 'manual',
+    isEstimate: !!(k.isEstimate ?? k.stima),
+    interventionIds: Array.isArray(k.interventionIds) ? k.interventionIds.slice(0, 30) : []
+  })).slice(0, 8000);
 }
 function recentMemory(context = {}) {
   return asArray(context.aiMemoryRecent).slice(0, 200).map(m => ({ at: m.at, userId: safeText(m.userId, 80), userName: safeText(m.userName, 100), kind: safeText(m.kind, 80), text: safeText(m.text, 1200) })).filter(m => m.text);
 }
-function buildContext(reqBody = {}) {
+function buildContext(reqBody = {}, authUser = null) {
   const raw = reqBody.context || {};
   const users = compactUsers(raw);
-  const currentUser = normalizeUser(raw.user) || users[0] || null;
+  // RV9: l'identità arriva dal token firmato, non dal context del client.
+  const fromToken = authUser ? (users.find(u => String(u.id) === String(authUser.uid)) || { id: authUser.uid, name: authUser.name || authUser.uid, role: authUser.role || '' }) : null;
+  const currentUser = fromToken || normalizeUser(raw.user) || users[0] || null;
+  if (fromToken && authUser.role && !fromToken.role) fromToken.role = authUser.role;
   const companies = compactCompanies(raw);
   const services = compactServices(raw);
   const shell = { users, currentUser, companies, services };
   const interventions = compactInterventions(raw, shell);
   const invoices = compactInvoices(raw, { ...shell, interventions });
   const kmRoutes = compactKm(raw);
-  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now: new Date() };
+  if (authUser && currentUser) currentUser.role = currentUser.role || authUser.role || '';
+  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now: new Date(), authRole: authUser ? authUser.role : (currentUser && currentUser.role) || '' };
 }
 
 function meaningfulTokens(s) {
@@ -745,26 +778,8 @@ function interventionKmValue(i) {
   return num(raw.km ?? raw.kmTot ?? raw.kmPercorsi ?? raw.chilometri ?? raw.distance ?? raw.distanza, 0);
 }
 function kmRowsFromContext(ctx, filters = {}) {
-  const routeRows = [];
-  const companyNorm = filters.company ? norm(filters.company.nome) : '';
-  for (const k of ctx.kmRoutes || []) {
-    if (filters.period && !inRange(k.data, filters.period)) continue;
-    if (filters.user && String(k.userId) !== String(filters.user.id) && norm(k.userName) !== norm(filters.user.name)) continue;
-    if (filters.company) {
-      const target = norm([k.azienda, k.to, k.from, k.aziendaId].filter(Boolean).join(' '));
-      if (String(k.aziendaId || '') !== String(filters.company.id || '') && !target.includes(companyNorm)) continue;
-    }
-    const km = num(k.km, 0);
-    if (!km) continue;
-    routeRows.push({ data:k.data, userId:k.userId, userName:k.userName, company:k.azienda || k.to || '', km, amount:num(k.amount,0), source:'tratta', label:[k.data, k.userName, k.azienda || k.to].filter(Boolean).join(' · ') });
-  }
-  if (routeRows.length) return { rows: routeRows, source:'tratte KM calcolate' };
-  const ints = filterInterventions(ctx, filters);
-  const interventionRows = ints.map(i => {
-    const km = interventionKmValue(i);
-    return { data:i.data, userId:i.userId, userName:i.userName, company:i.azienda, km, amount:0, source:'intervento', intervention:i, label:[i.data, i.userName, i.azienda].filter(Boolean).join(' · ') };
-  }).filter(r => r.km > 0);
-  return { rows: interventionRows, source:'KM registrati negli interventi' };
+  const pack = collectKmRows(ctx, filters);
+  return { rows: pack.rows, source: kmSourceLabel(pack.source), excluded: pack.excluded, isEstimate: pack.isEstimate };
 }
 function kmEfficiencyStats(ctx, filters = {}) {
   const pack = kmRowsFromContext(ctx, filters);
@@ -1404,33 +1419,6 @@ function companyMutationRequest(text, ctx) {
   const lines = Object.entries(fields).map(([k,v])=>`${k}: ${v}`).join('\n');
   return response(`Ho preparato la modifica cliente ${found.match.nome}:\n${lines}\nScrivi SALVA per aggiornare l'anagrafica.`, { type:'update_client', companyId: found.match.id, companyName: found.match.nome, fields, query:text }, actionButtons('save'));
 }
-function serviceMutationRequest(text, ctx) {
-  const n = norm(text);
-  const isCreate = /\b(crea|aggiungi|nuova|nuovo|inserisci)\b/.test(n) && /\b(prestazione|voce listino|farmaco|fiala|servizio)\b/.test(n);
-  const isDelete = /\b(elimina|cancella|rimuovi|togli)\b/.test(n) && /\b(prestazione|voce listino|listino|farmaco|fiala)\b/.test(n);
-  const amount = firstMoney(text);
-  const isUpdate = (/\b(modifica|cambia|aggiorna|correggi|imposta|metti|porta)\b/.test(n) && /\b(prezzo|listino|prestazione|farmaco|fiala)\b/.test(n)) || (/\bprezzo\b/.test(n) && Number.isFinite(amount) && /\b(a|=|euro|eur)\b/.test(n));
-  if (!isCreate && !isDelete && !isUpdate) return null;
-  if (isCreate) {
-    let name = textAfter(text, /(?:crea|aggiungi|nuova|nuovo|inserisci)\s+(?:prestazione|voce listino|farmaco|fiala|servizio)\s+(.+?)(?:\s+(?:prezzo|a|da)\s+\d|$)/i);
-    if (!name) name = textAfter(text, /(?:prestazione|voce listino|farmaco|fiala|servizio)\s+(.+?)(?:\s+(?:prezzo|a|da)\s+\d|$)/i);
-    if (!name) return response('Dimmi il nome della nuova voce listino e possibilmente il prezzo. Esempio: crea prestazione Controllo podale prezzo 45.');
-    const cat = textAfter(text, /categoria\s*[:=]?\s*([^,;.]+)/i) || 'Listino Rural Vet AI';
-    const tipo = /\bfarmaco\b/.test(n) ? 'Farmaco' : (/\bfiala\b/.test(n) ? 'Fiala' : 'Prestazione');
-    return response(`Ho preparato la nuova voce listino:\n${name}\nTipo: ${tipo} · Categoria: ${cat} · Prezzo: ${Number.isFinite(amount) ? euro(amount) : '0,00 €'}\nScrivi SALVA per crearla.`, { type:'create_service', name, cat, tipo, price:Number.isFinite(amount)?amount:0, query:text }, actionButtons('save'));
-  }
-  const serviceText = serviceTextFromRequest(text) || text;
-  const svc = resolveServices(serviceText, ctx.services);
-  const list = svc.alternatives.length ? svc.alternatives : svc.matches;
-  if (!list.length) return response('Non trovo la voce listino da modificare. Scrivimi il nome più preciso della prestazione/farmaco/fiala.');
-  if (svc.ambiguous && list.length > 1) return response('Ho trovato più voci listino possibili:\n' + list.map((p,i)=>`${i+1}) ${p.nome}${p.price ? ' · ' + euro(p.price) : ''}`).join('\n') + '\nQuale devo usare?');
-  const service = list[0];
-  if (isDelete) return response(`Ho preparato l'eliminazione della voce listino ${service.nome}. Scrivi ELIMINA per cancellarla.`, { type:'delete_service', serviceId: service.id, serviceName: service.nome, query:text }, actionButtons('delete'));
-  if (!Number.isFinite(amount)) return response(`Che prezzo devo impostare per ${service.nome}? Scrivimi ad esempio: prezzo ${service.nome} a 45 euro.`);
-  const companyRes = /\b(per|da|azienda|cliente)\b/.test(n) ? resolveCompany(text, ctx.companies, { allowWeak: true }) : { match:null };
-  const action = { type:'update_service', serviceId: service.id, serviceName: service.nome, fields:{ price: amount }, companyId: companyRes.match?.id || '', companyName: companyRes.match?.nome || '', query:text };
-  return response(`Ho preparato il nuovo prezzo ${companyRes.match ? 'specifico per ' + companyRes.match.nome : 'base'}:\n${service.nome}: ${euro(amount)}\nScrivi SALVA per aggiornare il listino.`, action, actionButtons('save'));
-}
 function invoiceCandidates(text, ctx) {
   const n = norm(text);
   const numMatch = safeText(text).match(/(?:fattura\s*(?:n\.?|numero)?\s*|n\.?\s*)(\d{1,8})/i);
@@ -1513,14 +1501,38 @@ function interventionUpdateLabel(key, value, target = null) {
 }
 function isUpdateInterventionRequest(text) {
   const n = norm(text);
-  return /\b(modifica|cambia|aggiorna|correggi|sposta|segna|marca|metti|aggiungi nota|nota)\b/.test(n) && /\b(intervento|prestazione|visita|cesar|fecond|insemin|ecograf|mastit|metrit|fatturat|nota|ore|ora|giorno|data)\b/.test(n);
+  return /\b(modifica|cambia|aggiorna|correggi|sposta|segna|marca|metti|aggiungi|togli|rimuovi|leva|porta|sostituisci|nota)\b/.test(n) && /\b(intervento|prestazione|visita|cesar|fecond|insemin|ecograf|mastit|metrit|fatturat|nota|ore|ora|giorno|data)\b/.test(n);
 }
 function updateInterventionRequest(text, ctx) {
   if (!isUpdateInterventionRequest(text)) return null;
-  const filters = managementFilters(text, ctx, /\boggi\b/.test(norm(text)) ? 'today' : 'ytd');
+  const scoped0 = enforceUserScope(ctx, managementFilters(text, ctx, /\boggi\b/.test(norm(text)) ? 'today' : 'ytd'));
+  const filters = scoped0.filters;
   let items = filterInterventions(ctx, filters).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora))).slice(0,12);
+
+  // RV9 · operazioni di riga sulle prestazioni dell'intervento (quantità, ±1,
+  // rimozione unità/riga, sostituzione totale/parziale, prezzo di riga).
+  const lineOps = parseLineOps(text, ctx);
+  if (lineOps.length) {
+    // Il filtro per prestazione va tolto: per un'aggiunta l'intervento di
+    // destinazione non contiene ancora la voce; la pertinenza sulle altre
+    // operazioni la garantisce lineOpsRelevant.
+    const lineFilters = { ...filters }; delete lineFilters.serviceText;
+    let lineItems = filterInterventions(ctx, lineFilters).sort((a,b)=>String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora))).slice(0,12);
+    const relevant = lineOpsRelevant(lineItems, lineOps);
+    if (!relevant.length) return response(`Non trovo un intervento con quelle prestazioni per ${displayScope(filters) || periodLabel(filters.period)}. Dimmi cliente e giorno.`);
+    if (relevant.length > 1) {
+      return response('Ho trovato più interventi possibili. Scegli il numero:\n' + relevant.map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), { type:'update_intervention', query:text, lineOps, options:relevant.map(i=>({interventionId:i.id})) }, []);
+    }
+    const target = relevant[0];
+    const ba = lineOpsBeforeAfter(target, lineOps, ctx);
+    const changed = JSON.stringify(ba.before.rows) !== JSON.stringify(ba.after.rows);
+    if (!changed) return response(`È già così:\n- ${formatIntervention(target)}\nNon c'è nulla da cambiare.`);
+    const action = { type:'update_intervention', interventionId:target.id, lineOps: ba.ops, before: ba.before, after: ba.after, recordVersion: num(target.raw?._v, 0), query:text };
+    return response(`Ho preparato la modifica alle prestazioni dell'intervento:\n${target.data} · ${target.ora || ''} · ${target.azienda} · ${target.userName || ''}\n\n${formatBeforeAfter(ba)}\n\nScrivi SALVA per applicare.`, action, actionButtons('save'), aiUi('intervention_wizard', 'confirmation', null, false, { scope: rvScope(ctx) }));
+  }
+
   const updates = parseInterventionUpdates(text, ctx);
-  if (!Object.keys(updates).length) return response('Che cosa devo cambiare dell’intervento? Posso modificare data, ora, cliente, prestazioni, note o stato fatturato.');
+  if (!Object.keys(updates).length) return response('Che cosa devo cambiare dell’intervento? Posso modificare data, ora, cliente, prestazioni (quantità, sostituzioni, prezzi di riga), note o stato fatturato.');
   // Se è una sostituzione ("cambia il cesareo in visita clinica"), considera solo gli interventi che contengono la prestazione di partenza
   if (updates.replaceService) {
     const withFrom = items.filter(i => (i.prestazioni || []).some(p => String(p.id) === String(updates.replaceService.fromId)));
@@ -1703,26 +1715,6 @@ function revenueQuery(text, ctx) {
   const fatturePagate = invoiceTotal(invPaid);
   const fattureAperte = invoiceTotal(invUnpaid);
   return { reply: `Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(giaFatturati)} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} · Incassato: ${euro(fatturePagate)} · Da pagare: ${euro(fattureAperte)}.`, action: null, actions: [], learn: [] };
-}
-function kmQuery(text, ctx) {
-  const n = norm(text);
-  if (!/\b(km|chilometri|rimborso|rimborsi)\b/.test(n)) return null;
-  const filters = managementFilters(text, ctx, /oggi/.test(n) ? 'today' : (/settimana|settiman/.test(n) ? 'week' : 'ytd'));
-  const pack = kmRowsFromContext(ctx, filters);
-  const scope = displayScope(filters) || periodLabel(filters.period);
-  if (!pack.rows.length) return response(`Non ho dati KM nel contesto per ${scope}. Posso usare tratte KM calcolate o KM salvati negli interventi.`, null, ['Efficienza KM','Interventi periodo','Cockpit Rural Vet AI']);
-  const kmTot = pack.rows.reduce((s,k)=>s+num(k.km),0);
-  const amount = pack.rows.reduce((s,k)=>s+num(k.amount),0);
-  const byUser = /per\s+(veterinario|collaboratore|utente)|team/.test(n);
-  const byCompany = /per\s+(cliente|azienda)|clienti|aziende/.test(n);
-  const rows = groupMap(pack.rows, k => byUser ? (k.userName || k.userId || 'Utente') : (byCompany ? (k.company || 'Cliente') : dayKey(k.data)), k => k.km)
-    .sort((a,b)=> byUser || byCompany ? b.total-a.total : String(a.key).localeCompare(String(b.key)))
-    .map(r => ({ label:r.key, value:r.total, count:r.count, unit:'km' }));
-  const reply = `KM ${scope}: ${kmTot.toFixed(1).replace('.', ',')} km${amount ? ' · rimborso ' + euro(amount) : ''}.\nFonte: ${pack.source}.\n` + pack.rows.slice(0,12).map(k => `- ${k.data || '?'} · ${k.userName || '?'} · ${k.company || '?'}: ${num(k.km).toFixed(1).replace('.', ',')} km`).join('\n');
-  if (wantsChart(text) || /andamento|trend|per\s+(giorno|veterinario|collaboratore|utente|cliente|azienda)|clienti|aziende/.test(n)) {
-    return chartResponse(reply, chartObject(rows.length > 8 ? 'line' : 'bar', `KM · ${scope}`, rows, { unit:'km', seriesName:'KM' }), ['Efficienza KM','Ricavi periodo','KPI periodo','Interventi periodo']);
-  }
-  return response(reply, null, ['Grafico KM','Efficienza KM','Ricavi periodo','KPI periodo']);
 }
 function dashboardQuery(text, ctx) {
   if (!/\bdashboard\b|\bquadro\b|\briassunto\b/.test(norm(text))) return null;
@@ -2062,8 +2054,9 @@ function deleteInterventionRequest(text, ctx) {
   return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
 }
 function deterministicRouter(text, ctx) {
+  if (ctx.raw?.pendingServiceDraft) { const r = continueServiceDraft(text, ctx.raw.pendingServiceDraft, ctx); if (r) return r; }
   if (ctx.raw?.pendingInterventionDraft?.type === 'intervention_draft') return continuePendingInterventionDraft(text, ctx.raw.pendingInterventionDraft, ctx);
-  const handlers = [smallTalkQuery, managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceMutationRequest, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, ruralVetAiSelfTestQuery, uploadPreflightQuery, ruralVetAiCockpitQuery, weeklyDigestQuery, performanceVeterinariQuery, kmEfficiencyQuery, dailyClosureQuery, monthProjectionQuery, auditGestionaleQuery, cashflowQuery, interventionAnomaliesQuery, listinoQualityQuery, smartSuggestionsQuery, nextActionsQuery, dataQualityQuery, inactiveClientsQuery, ruralVetAiBriefingQuery, kmQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
+  const handlers = [smallTalkQuery, managementHelpQuery, learnQuery, settingsMutationRequest, invoiceMutationRequest, serviceCatalogRouter, companyMutationRequest, createClientRequest, updateInterventionRequest, deleteInterventionRequest, createInterventionRequest, clientLookup, countClients, serviceLookup, ruralVetAiSelfTestQuery, uploadPreflightQuery, ruralVetAiCockpitQuery, weeklyDigestQuery, performanceVeterinariQuery, kmEfficiencyQuery, dailyClosureQuery, monthProjectionQuery, auditGestionaleQuery, cashflowQuery, interventionAnomaliesQuery, listinoQualityQuery, smartSuggestionsQuery, nextActionsQuery, dataQualityQuery, inactiveClientsQuery, ruralVetAiBriefingQuery, kmAnalyticsQuery, analyticsQuery, revenueQuery, interventionQuery, dashboardQuery];
   for (const h of handlers) {
     const ans = h(text, ctx);
     if (ans) return ans;
@@ -2099,7 +2092,7 @@ function executePlan(plan, text, ctx) {
   if (intent === 'service_lookup') return serviceLookup([text, safeText(plan.serviceText, 200), 'prezzo listino'].join(' '), ctx);
   if (intent === 'intervention_query') return interventionQuery(pText + ' interventi riepilogo', ctx);
   if (intent === 'revenue_query' || intent === 'invoice_query' || intent === 'analytics_query') return analyticsQuery(pText + ' fatturato ricavi fatture analisi', ctx) || revenueQuery(pText + ' fatturato ricavi fatture', ctx);
-  if (intent === 'km_query') return kmQuery(pText + ' km', ctx);
+  if (intent === 'km_query') return kmAnalyticsQuery(pText + ' km', ctx);
   if (intent === 'audit_gestionale_query') return auditGestionaleQuery(text, ctx);
   if (intent === 'cashflow_query') return cashflowQuery(text, ctx);
   if (intent === 'intervention_anomalies_query') return interventionAnomaliesQuery(text, ctx);
@@ -2118,7 +2111,7 @@ function executePlan(plan, text, ctx) {
   if (intent === 'delete_intervention') return deleteInterventionRequest(text, ctx);
   if (intent === 'create_client') return createClientRequest(text, ctx);
   if (intent === 'update_client' || intent === 'delete_client') return companyMutationRequest(text, ctx);
-  if (intent === 'create_service' || intent === 'update_service' || intent === 'delete_service') return serviceMutationRequest(text, ctx);
+  if (intent === 'create_service' || intent === 'update_service' || intent === 'delete_service') return serviceCatalogRouter(text, ctx);
   if (intent === 'create_invoice' || intent === 'update_invoice' || intent === 'delete_invoice') return invoiceMutationRequest(text, ctx);
   if (intent === 'update_settings') return settingsMutationRequest(text, ctx);
   if (intent === 'learn') return learnQuery(text, ctx);
@@ -2260,7 +2253,8 @@ function validateAction(result, ctx) {
     }
     if ((a.type === 'delete_intervention' || a.type === 'update_intervention') && a.interventionId && !ctx.interventions.some(i => String(i.id) === String(a.interventionId))) { a.interventionId = ''; safe = false; }
     if ((a.type === 'update_client' || a.type === 'delete_client' || a.type === 'create_invoice') && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) { a.companyId = ''; safe = false; }
-    if ((a.type === 'update_service' || a.type === 'delete_service') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) { a.serviceId = ''; safe = false; }
+    if ((a.type === 'update_service' || a.type === 'delete_service' || a.type === 'archive_service' || a.type === 'restore_service' || a.type === 'remove_company_price') && a.serviceId && !ctx.services.some(p => String(p.id) === String(a.serviceId))) { a.serviceId = ''; safe = false; }
+    if (a.type === 'remove_company_price' && a.companyId && !ctx.companies.some(c => String(c.id) === String(a.companyId))) { a.companyId = ''; safe = false; }
     if ((a.type === 'update_invoice' || a.type === 'delete_invoice') && a.invoiceId && !ctx.invoices.some(f => String(f.id) === String(a.invoiceId))) { a.invoiceId = ''; safe = false; }
   }
   if (result.ui.mode === 'intervention_wizard' && result.ui.awaiting !== 'confirm') safe = false;
@@ -2268,8 +2262,657 @@ function validateAction(result, ctx) {
   return result;
 }
 
+/* ================================================================== */
+/* RV9 · AUTENTICAZIONE, SCOPE E BOZZE FIRMATE                        */
+/* Il backend è la fonte di verità per identità e permessi: il       */
+/* context inviato dal client non può più impersonare nessuno.       */
+/* ================================================================== */
+
+const RV_AI_SECRET = (() => {
+  const explicit = safeText(process.env.RV_AI_SECRET || '', 200).trim();
+  if (explicit) return explicit;
+  const seed = safeText(process.env.JSONBIN_API_KEY || '', 200) + safeText(process.env.JSONBIN_BIN_ID || '', 200);
+  if (seed.trim()) return crypto.createHash('sha256').update('rv9|' + seed).digest('hex');
+  console.warn('[RV9] Nessun RV_AI_SECRET né credenziali JSONBin: uso un secret di sviluppo. Imposta RV_AI_SECRET su Render.');
+  return 'rv9-dev-secret-non-usare-in-produzione';
+})();
+const RV_AUTH_OPTIONAL = String(process.env.RV_AUTH_OPTIONAL || 'false').toLowerCase() === 'true';
+const RV_TOKEN_TTL_MS = Number(process.env.RV_TOKEN_TTL_MS || 12 * 60 * 60 * 1000);
+
+function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+function hmacHex(s) { return crypto.createHmac('sha256', RV_AI_SECRET).update(String(s)).digest('hex'); }
+function b64u(obj) { return Buffer.from(JSON.stringify(obj)).toString('base64url'); }
+function unb64u(s) { try { return JSON.parse(Buffer.from(String(s), 'base64url').toString('utf8')); } catch { return null; } }
+
+// Registro utenti lato server. Le password non vivono più in chiaro nel client:
+// qui ci sono solo gli hash; override con RV_USER_<ID>_PASS (in chiaro, hashata al volo).
+const RV_BASE_USERS = [
+  { id: 'ruralvet', name: 'Rural Vet', role: 'company', passHash: '158a323a7ba44870f23d96f1516dd70aa48e9a72db4ebb026b0a89e212a208ab', aiAccess: true },
+  { id: 'medardo', name: 'Medardo Cammi', role: 'worker', passHash: '3d1e557b540ac045b3b327994a351f08a443f9216f9b2b8d3a0f42b58671ac83', aiAccess: true },
+  { id: 'edoardo', name: 'Edoardo Ronda', role: 'worker', passHash: '9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0', aiAccess: false }
+];
+function rvRegistryUser(id) {
+  const base = RV_BASE_USERS.find(u => u.id === String(id || '').toLowerCase());
+  if (!base) return null;
+  const override = process.env['RV_USER_' + base.id.toUpperCase() + '_PASS'];
+  return override ? { ...base, passHash: sha256Hex(override) } : base;
+}
+function rvMakeToken(user) {
+  const payload = { uid: user.id, name: user.name, role: user.role, ai: !!user.aiAccess, exp: Date.now() + RV_TOKEN_TTL_MS };
+  const body = b64u(payload);
+  return body + '.' + hmacHex(body);
+}
+function rvVerifyToken(token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 2) return null;
+  const [body, sig] = parts;
+  const expected = hmacHex(body);
+  if (sig.length !== expected.length) return null;
+  try { if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; } catch { return null; }
+  const payload = unb64u(body);
+  if (!payload || !payload.uid || !payload.exp || Date.now() > Number(payload.exp)) return null;
+  return payload;
+}
+function rvTokenFromReq(req) {
+  const h = String(req.headers.authorization || '');
+  if (/^Bearer\s+/i.test(h)) return h.replace(/^Bearer\s+/i, '').trim();
+  return safeText(req.body?.authToken || req.query?.authToken || '', 600);
+}
+function requireAuth(req, res, next) {
+  const payload = rvVerifyToken(rvTokenFromReq(req));
+  if (payload) { req.rvUser = payload; return next(); }
+  if (RV_AUTH_OPTIONAL) { req.rvUser = null; return next(); }
+  return res.status(401).json({ ok: false, error: 'auth_required', reply: 'Sessione scaduta o assente. Esegui di nuovo l\u2019accesso al gestionale.' });
+}
+function requireAi(req, res, next) {
+  const payload = rvVerifyToken(rvTokenFromReq(req));
+  if (!payload) {
+    if (RV_AUTH_OPTIONAL) { req.rvUser = null; return next(); }
+    return res.status(401).json({ ok: false, error: 'auth_required', reply: 'Per usare Rural Vet AI devi prima accedere al gestionale.' });
+  }
+  if (!payload.ai) return res.status(403).json({ ok: false, error: 'ai_forbidden', reply: 'Rural Vet AI non \u00e8 abilitata per questo account.' });
+  req.rvUser = payload;
+  return next();
+}
+
+// Bozze firmate: vivono nel client (il backend su Render è stateless e può
+// riavviarsi), ma sono a prova di manomissione grazie alla firma HMAC.
+function signDraft(draft) {
+  const payload = b64u({ ...draft, _at: draft._at || Date.now() });
+  return { payload, sig: hmacHex(payload) };
+}
+function readSignedDraft(signed) {
+  if (!signed || typeof signed !== 'object' || !signed.payload || !signed.sig) return null;
+  const expected = hmacHex(String(signed.payload));
+  if (String(signed.sig).length !== expected.length) return null;
+  try { if (!crypto.timingSafeEqual(Buffer.from(String(signed.sig)), Buffer.from(expected))) return null; } catch { return null; }
+  const draft = unb64u(signed.payload);
+  if (!draft || (Date.now() - Number(draft._at || 0)) > 6 * 60 * 60 * 1000) return null;
+  return draft;
+}
+function newDraftId(kind) { return 'draft-' + kind + '-' + Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex'); }
+
+function rvScope(ctx) {
+  const u = ctx.currentUser || {};
+  const company = String(u.role || '').toLowerCase() === 'company' || String(u.id) === 'ruralvet';
+  return { type: company ? 'company' : 'personal', userId: u.id || '', label: u.name || '' };
+}
+// Un worker vede solo i propri dati: qualunque filtro utente richiesto viene
+// riportato a se stesso (e la cosa viene dichiarata nella risposta).
+function enforceUserScope(ctx, filters) {
+  const scope = rvScope(ctx);
+  if (scope.type === 'company') return { filters, forced: false };
+  const wanted = filters.user ? String(filters.user.id) : null;
+  if (wanted && wanted !== String(ctx.currentUser?.id)) {
+    return { filters: { ...filters, user: ctx.currentUser }, forced: true };
+  }
+  return { filters: { ...filters, user: filters.user || ctx.currentUser }, forced: false };
+}
+
+/* ================================================================== */
+/* RV9 · MOTORE KM DETERMINISTICO                                     */
+/* Gerarchia fonti (mai sommate per lo stesso viaggio):               */
+/*  1) tratte materializzate dal gestionale (db.kmRoutes)             */
+/*  2) KM salvati direttamente sugli interventi                       */
+/*  3) stima dalla distanza azienda (dichiarata come stima)           */
+/* ================================================================== */
+
+const KM_ANOMALY_MAX = Number(process.env.KM_ANOMALY_MAX || 400);
+
+function kmSourceLabel(code) {
+  return {
+    registered_routes: 'tratte registrate',
+    intervention_km: 'KM salvati negli interventi',
+    company_distance_estimate: 'stima dalla distanza azienda (andata e ritorno)',
+    mixed_routes: 'tratte registrate (in parte stimate dalla distanza azienda)',
+    none: 'nessun dato KM'
+  }[code] || code;
+}
+
+function collectKmRows(ctx, filters = {}) {
+  const excluded = [];
+  const period = filters.period || null;
+  const userF = filters.user || null;
+  const companyF = filters.company || null;
+  const companyNorm = companyF ? norm(companyF.nome) : '';
+
+  const keep = [];
+  for (const k of ctx.kmRoutes || []) {
+    if (!k.data || !dateFromISO(k.data)) { excluded.push({ id: k.id || '', reason: 'tratta senza data valida' }); continue; }
+    const km = num(k.km, 0);
+    if (km < 0) { excluded.push({ id: k.id || '', reason: `km negativi (${km})` }); continue; }
+    if (km === 0) continue;
+    if (km > KM_ANOMALY_MAX) { excluded.push({ id: k.id || '', reason: `km anomali (${km} > ${KM_ANOMALY_MAX})` }); continue; }
+    if (userF && !k.userId && norm(k.userName || '') !== norm(userF.name || '')) { excluded.push({ id: k.id || '', reason: 'tratta senza utente' }); continue; }
+    if (period && !inRange(k.data, period)) continue;
+    if (userF && String(k.userId || '') !== String(userF.id) && norm(k.userName || '') !== norm(userF.name || '')) continue;
+    if (companyF) {
+      const target = norm([k.azienda, k.to, k.from].filter(Boolean).join(' '));
+      if (String(k.aziendaId || '') !== String(companyF.id || '') && !(companyNorm && target.includes(companyNorm))) continue;
+    }
+    keep.push({
+      data: k.data, userId: k.userId, userName: k.userName, company: k.azienda || k.to || '',
+      companyId: k.aziendaId || '', km, amount: num(k.amount, 0), sess: k.sess || '',
+      isEstimate: !!k.isEstimate || k.method === 'company_distance',
+      method: k.method || 'manual',
+      interventionIds: asArray(k.interventionIds),
+      label: [k.data, k.userName, (k.from || '') + ' \u2192 ' + (k.to || k.azienda || '')].filter(Boolean).join(' \u00b7 ')
+    });
+  }
+  if (keep.length) {
+    const estimates = keep.filter(r => r.isEstimate).length;
+    const source = estimates === 0 ? 'registered_routes' : (estimates === keep.length ? 'company_distance_estimate' : 'mixed_routes');
+    return { rows: keep, source, isEstimate: estimates === keep.length, partialEstimate: estimates > 0 && estimates < keep.length, excluded };
+  }
+
+  // Fonte 2: KM salvati direttamente sugli interventi
+  const ints = filterInterventions(ctx, filters);
+  const fromInts = [];
+  for (const i of ints) {
+    const km = interventionKmValue(i);
+    if (km < 0) { excluded.push({ id: i.id, reason: `km negativi sull'intervento (${km})` }); continue; }
+    if (km > KM_ANOMALY_MAX) { excluded.push({ id: i.id, reason: `km anomali sull'intervento (${km})` }); continue; }
+    if (km > 0) fromInts.push({ data: i.data, userId: i.userId, userName: i.userName, company: i.azienda, companyId: i.aziendaId, km, amount: 0, isEstimate: false, method: 'intervention', interventionIds: [i.id], label: [i.data, i.userName, i.azienda].filter(Boolean).join(' \u00b7 ') });
+  }
+  if (fromInts.length) return { rows: fromInts, source: 'intervention_km', isEstimate: false, partialEstimate: false, excluded };
+
+  // Fonte 3: stima deterministica dalla distanza azienda.
+  // Regola (identica al gestionale): per ogni utente/giorno/sessione, in ordine
+  // di orario: prima tratta = distanza prima azienda; tratte intermedie =
+  // |distanza(i) - distanza(i-1)|; rientro = distanza ultima azienda.
+  const byTrip = new Map();
+  for (const i of ints) {
+    if (!i.data || !dateFromISO(i.data)) { excluded.push({ id: i.id, reason: 'intervento senza data valida' }); continue; }
+    if (!i.userId && !i.userName) { excluded.push({ id: i.id, reason: 'intervento senza utente' }); continue; }
+    const key = [i.userId || norm(i.userName), i.data, i.sess || 'm'].join('|');
+    if (!byTrip.has(key)) byTrip.set(key, []);
+    byTrip.get(key).push(i);
+  }
+  const est = [];
+  for (const [key, trip] of byTrip) {
+    trip.sort((a, b) => String(a.ora || '').localeCompare(String(b.ora || '')));
+    const seen = new Set();
+    let prevDist = 0, first = true, lastDist = 0, lastCompany = null;
+    for (const i of trip) {
+      const cid = String(i.aziendaId || norm(i.azienda));
+      if (seen.has(cid)) continue; // due interventi nella stessa azienda nello stesso giro = una sola tratta
+      seen.add(cid);
+      const c = ctx.companies.find(x => String(x.id) === String(i.aziendaId));
+      const dist = num(c?.km ?? c?.raw?.km, 0);
+      if (!dist) { excluded.push({ id: i.id, reason: `distanza azienda mancante (${i.azienda || '?'})` }); continue; }
+      const leg = first ? dist : Math.abs(dist - prevDist) || dist;
+      est.push({ data: i.data, userId: i.userId, userName: i.userName, company: i.azienda, companyId: i.aziendaId, km: leg, amount: 0, isEstimate: true, method: 'company_distance', sess: i.sess || '', interventionIds: [i.id], label: [i.data, i.userName, (first ? 'Casa' : '') + ' \u2192 ' + i.azienda].filter(Boolean).join(' \u00b7 ') });
+      prevDist = dist; lastDist = dist; lastCompany = i; first = false;
+    }
+    if (lastCompany && lastDist) {
+      est.push({ data: lastCompany.data, userId: lastCompany.userId, userName: lastCompany.userName, company: lastCompany.azienda, companyId: lastCompany.aziendaId, km: lastDist, amount: 0, isEstimate: true, method: 'company_distance', sess: lastCompany.sess || '', interventionIds: [], label: [lastCompany.data, lastCompany.userName, lastCompany.azienda + ' \u2192 Casa (rientro)'].filter(Boolean).join(' \u00b7 ') });
+    }
+  }
+  if (est.length) return { rows: est, source: 'company_distance_estimate', isEstimate: true, partialEstimate: false, excluded };
+  return { rows: [], source: 'none', isEstimate: false, partialEstimate: false, excluded };
+}
+
+function kmStats(ctx, filters = {}) {
+  const pack = collectKmRows(ctx, filters);
+  const ints = filterInterventions(ctx, filters);
+  const totalKm = Math.round(pack.rows.reduce((s, r) => s + r.km, 0) * 10) / 10;
+  const days = new Set(pack.rows.map(r => r.data));
+  const companies = new Set(pack.rows.map(r => String(r.companyId || norm(r.company))).filter(Boolean));
+  const amount = Math.round(pack.rows.reduce((s, r) => s + num(r.amount, 0), 0) * 100) / 100;
+  return {
+    ...pack, totalKm, amount,
+    routeCount: pack.rows.length,
+    activeDays: days.size,
+    companiesCount: companies.size,
+    interventionCount: ints.length,
+    averageKmPerIntervention: ints.length ? Math.round((totalKm / ints.length) * 100) / 100 : 0,
+    averageKmPerDay: days.size ? Math.round((totalKm / days.size) * 10) / 10 : 0,
+    topDays: groupMap(pack.rows, r => dayKey(r.data), r => r.km).sort((a, b) => b.total - a.total).slice(0, 3).map(r => ({ label: r.key, value: Math.round(r.total * 10) / 10 }))
+  };
+}
+
+function fmtKm(v) { return (Math.round(num(v, 0) * 10) / 10).toFixed(1).replace('.', ','); }
+
+function kmComparisonTarget(text, ctx) {
+  const n = norm(text);
+  if (!/\bconfront|\brispetto a\b|\bvs\b|\bcontro\b/.test(n)) return null;
+  const tail = safeText(text).replace(/^.*?(?:confronta(?:mi|li)?|rispetto a|vs|contro)\s*/i, '');
+  const p = parsePeriod(tail, ctx.now, 'all');
+  return p || null;
+}
+
+function kmAnalyticsQuery(text, ctx) {
+  const n = norm(text);
+  if (!/\b(km|chilometri|tratte|tratta|percors[oiea]|spostament)/.test(n)) return null;
+  if (/\b(efficienza km|ricavi per km|redditivita)/.test(n)) return null; // resta a kmEfficiencyQuery
+  const baseFilters = managementFilters(text, ctx, /\boggi\b/.test(n) ? 'today' : (/settiman/.test(n) ? 'week' : (/\bmese\b/.test(n) ? 'month' : 'ytd')));
+  const scoped = enforceUserScope(ctx, baseFilters);
+  const filters = scoped.filters;
+  const scope = rvScope(ctx);
+  const st = kmStats(ctx, filters);
+  const periodLbl = periodLabel(filters.period) || 'periodo';
+  const who = filters.user ? filters.user.name : 'Rural Vet (tutti)';
+  const ui = aiUi('km_analytics', null, null, false, { scope, period: filters.period });
+
+  if (!st.rows.length) {
+    const missing = st.excluded.length ? `\nRecord esclusi: ${st.excluded.slice(0, 5).map(e => e.reason).join('; ')}${st.excluded.length > 5 ? '\u2026' : ''}` : '';
+    return { ...response(`KM percorsi \u00b7 ${who}\n${periodLbl}\n\nNessun dato KM affidabile per questo periodo.\nPer calcolarli servono: tratte registrate, oppure KM sugli interventi, oppure la distanza (km) compilata nelle schede azienda.${missing}`, null, ['KM questa settimana', 'KM questo mese', 'Cockpit Rural Vet AI'], ui), data: { period: filters.period, totalKm: 0, routeCount: 0, source: 'none', isEstimate: false, excludedRecords: st.excluded } };
+  }
+
+  const compareWith = kmComparisonTarget(text, ctx) || (/\bconfront/.test(n) ? periodForPrevious(filters.period) : null);
+  let compareBlock = '';
+  let compareData = null;
+  if (compareWith) {
+    const prev = kmStats(ctx, { ...filters, period: compareWith });
+    const delta = Math.round((st.totalKm - prev.totalKm) * 10) / 10;
+    compareData = { period: compareWith, totalKm: prev.totalKm, delta };
+    compareBlock = `\n\nConfronto \u00b7 ${periodLabel(compareWith)}: ${fmtKm(prev.totalKm)} km (${delta >= 0 ? '+' : ''}${fmtKm(delta)} km)`;
+  }
+
+  const wantDetail = /\btratte\b|\bdettaglio\b|\btragitt/.test(n) || (filters.period && filters.period.from === filters.period.to);
+  const singleDay = filters.period && filters.period.from === filters.period.to;
+  const sourceLine = `Fonte: ${kmSourceLabel(st.source)}${st.partialEstimate ? ' \u00b7 alcune tratte sono stime' : ''}`;
+  const estimateLine = st.isEstimate ? '\n\u26a0\ufe0f Valore stimato, non misurato: distanze azienda con andata e ritorno.' : '';
+  const excludedLine = st.excluded.length ? `\nRecord esclusi dal calcolo: ${st.excluded.length} (${[...new Set(st.excluded.map(e => e.reason))].slice(0, 3).join('; ')})` : '';
+
+  let body;
+  if (singleDay) {
+    body = `Totale: ${fmtKm(st.totalKm)} km\nTratte: ${st.routeCount}\nAziende visitate: ${st.companiesCount}\nInterventi: ${st.interventionCount}\n${sourceLine}`;
+  } else {
+    body = `Totale: ${fmtKm(st.totalKm)} km\nMedia giornaliera: ${fmtKm(st.averageKmPerDay)} km\nGiorni con spostamenti: ${st.activeDays}\nInterventi: ${st.interventionCount}\nMedia: ${fmtKm(st.averageKmPerIntervention)} km per intervento\n${sourceLine}`;
+    if (st.topDays.length > 1) body += '\n\nGiornate principali:\n' + st.topDays.map((d, i) => `${i + 1}. ${d.label} \u2014 ${fmtKm(d.value)} km`).join('\n');
+  }
+  let detail = '';
+  if (wantDetail) detail = '\n\nTratte:\n' + st.rows.slice(0, 14).map(r => `- ${r.data} \u00b7 ${r.userName || '?'} \u00b7 ${r.company || '?'}: ${fmtKm(r.km)} km${r.isEstimate ? ' (stima)' : ''}`).join('\n') + (st.rows.length > 14 ? `\n\u2026 e altre ${st.rows.length - 14} tratte` : '');
+
+  const forcedLine = scoped.forced ? '\n(Nota: il tuo account vede solo i propri KM, ho usato i tuoi dati.)' : '';
+  const reply = `KM percorsi \u00b7 ${who}\n${periodLbl}\n\n${body}${detail}${compareBlock}${estimateLine}${excludedLine}${forcedLine}`;
+
+  const byUser = /per\s+(veterinario|collaboratore|utente)|\bconfronta\b.*\b(medardo|edoardo|team)\b|\bteam\b/.test(n) && scope.type === 'company';
+  const byCompany = /per\s+(cliente|azienda)|\bper aziend/.test(n);
+  const chartRows = groupMap(st.rows, r => byUser ? (r.userName || r.userId || 'Utente') : (byCompany ? (r.company || 'Cliente') : dayKey(r.data)), r => r.km)
+    .sort((a, b) => (byUser || byCompany) ? b.total - a.total : String(a.key).localeCompare(String(b.key)))
+    .map(r => ({ label: r.key, value: Math.round(r.total * 10) / 10, unit: 'km' }));
+  const chart = chartRows.length > 1 ? chartObject(chartRows.length > 10 ? 'line' : 'bar', `KM \u00b7 ${periodLbl}`, chartRows, { unit: 'km', seriesName: 'KM' }) : null;
+
+  const data = {
+    period: filters.period, totalKm: st.totalKm, routeCount: st.routeCount, activeDays: st.activeDays,
+    interventionCount: st.interventionCount, companiesCount: st.companiesCount,
+    averageKmPerIntervention: st.averageKmPerIntervention, averageKmPerDay: st.averageKmPerDay,
+    source: st.source, isEstimate: st.isEstimate, excludedRecords: st.excluded, compare: compareData, rimborso: st.amount || 0
+  };
+  const qrs = singleDay ? ['Mostra dettaglio', 'Confronta con ieri', 'KM questa settimana'] : ['Mostra dettaglio', 'Confronta col periodo precedente', 'KM per azienda'];
+  const base = chart ? chartResponse(reply, chart, qrs, {}) : response(reply, null, qrs, ui);
+  return { ...base, ui: { ...(base.ui || {}), ...ui }, data };
+}
+
+/* ================================================================== */
+/* RV9 · GESTIONE PRESTAZIONI (listino)                               */
+/* Creazione guidata con controllo duplicati, modifica con PRIMA/DOPO */
+/* e no-op, prezzo per azienda (anche rimozione), archiviazione,      */
+/* eliminazione con vincoli, ripristino. Bozze firmate lato server.   */
+/* ================================================================== */
+
+function serviceIsArchived(s) { return !!(s && (s.raw?.archived || s.raw?.inactive)); }
+function activeServices(ctx) { return ctx.services.filter(s => !serviceIsArchived(s)); }
+function serviceUsage(ctx, serviceId) {
+  const sid = String(serviceId);
+  const usedInts = ctx.interventions.filter(i => (i.prestazioni || []).some(p => String(p.id) === sid));
+  const usedInvoiced = usedInts.filter(i => i.fatt);
+  const customPriceCompanies = ctx.companies.filter(c => c.raw && c.raw.prezzi && c.raw.prezzi[sid] != null);
+  return {
+    interventions: usedInts.length,
+    invoiced: usedInvoiced.length,
+    unbilled: usedInts.length - usedInvoiced.length,
+    customPrices: customPriceCompanies.map(c => ({ id: c.id, nome: c.nome, price: num(c.raw.prezzi[sid], 0) })),
+    used: usedInts.length > 0
+  };
+}
+function normalizeServiceName(name) {
+  const s = safeText(name, 220).trim().replace(/\s+/g, ' ');
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+}
+function serviceDraftSummary(d) {
+  return `${d.name}\nCategoria: ${d.cat || '\u2014'} \u00b7 Tipo: ${d.tipo || 'Prestazione'} \u00b7 Prezzo: ${Number.isFinite(d.price) ? euro(d.price) : '\u2014'}${d.unit ? ' \u00b7 Unit\u00e0: ' + d.unit : ''}`;
+}
+function serviceDraftReply(draft, ctx, extraNote = '') {
+  const scope = rvScope(ctx);
+  if (!draft.name) return guidedResponse('Come si chiama la nuova voce di listino?', { type: 'continue_service_draft', draft: signDraft({ ...draft, awaiting: 'name' }), awaiting: 'name' }, ['Annulla'], aiUi('service_action_wizard', 'name', draft, false, { scope }));
+  if (!Number.isFinite(draft.price)) {
+    return guidedResponse(`Che prezzo devo impostare per \u201c${draft.name}\u201d?\nScrivi l'importo (es. 45) oppure 0 se il prezzo varia.`, { type: 'continue_service_draft', draft: signDraft({ ...draft, awaiting: 'price' }), awaiting: 'price' }, ['0', 'Annulla'], aiUi('service_action_wizard', 'price', draft, false, { scope }));
+  }
+  if (!draft.cat) {
+    const cats = [...new Set(activeServices(ctx).map(s => s.cat).filter(Boolean))].slice(0, 6);
+    return guidedResponse(`In quale categoria metto \u201c${draft.name}\u201d?`, { type: 'continue_service_draft', draft: signDraft({ ...draft, awaiting: 'cat' }), awaiting: 'cat' }, [...cats, 'Nuova categoria: scrivila', 'Annulla'].slice(0, 8), aiUi('service_action_wizard', 'cat', draft, false, { scope }));
+  }
+  const dupLine = draft.dupWarned && draft.dupNames?.length ? `\n\u26a0\ufe0f Simili gi\u00e0 a listino: ${draft.dupNames.join(', ')} (creo comunque una voce nuova).` : '';
+  const action = { type: 'create_service', name: draft.name, cat: draft.cat, tipo: draft.tipo || 'Prestazione', price: draft.price, unit: draft.unit || '', draftId: draft.draftId, query: draft.query || '' };
+  return guidedResponse(`Riepilogo nuova voce listino:${extraNote}\n${serviceDraftSummary(draft)}${dupLine}\nScrivi SALVA per crearla.`, action, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', draft, false, { scope, draftId: draft.draftId }));
+}
+function continueServiceDraft(text, signed, ctx) {
+  const draft = readSignedDraft(signed);
+  if (!draft) return response('La bozza in corso non \u00e8 pi\u00f9 valida (scaduta o alterata). Ricominciamo: dimmi cosa vuoi fare sul listino.', null, ['Gestisci prestazioni', 'Annulla']);
+  const n = norm(text);
+  if (/^(annulla|cancella tutto|lascia stare|stop)$/.test(n)) return response('Ok, bozza annullata. Nulla \u00e8 stato modificato.', { type: 'clear_service_draft' }, ['Gestisci prestazioni']);
+  if (draft.kind === 'service_create') {
+    if (draft.awaiting === 'name' || !draft.name) {
+      draft.name = normalizeServiceName(text);
+      const dups = findServiceCandidates(draft.name, activeServices(ctx), { limit: 3 }).filter(c => c.score >= 55);
+      if (dups.length && !draft.dupWarned) { draft.dupWarned = true; draft.dupNames = dups.map(d => d.nome); }
+      draft.awaiting = null;
+      return serviceDraftReply(draft, ctx);
+    }
+    if (draft.awaiting === 'price') {
+      const amount = firstMoney(text);
+      if (!Number.isFinite(amount)) return serviceDraftReply(draft, ctx);
+      draft.price = amount; draft.awaiting = null;
+      return serviceDraftReply(draft, ctx);
+    }
+    if (draft.awaiting === 'cat') {
+      draft.cat = normalizeServiceName(text.replace(/^nuova categoria:?\s*/i, ''));
+      draft.awaiting = null;
+      return serviceDraftReply(draft, ctx);
+    }
+    return serviceDraftReply(draft, ctx);
+  }
+  return null;
+}
+
+function parseServiceEdits(text) {
+  const edits = {};
+  const renameTo = textAfter(text, /\brinomina\b.+?\bin\b\s+(.+?)(?:\s*[,;.]|$)/i) || textAfter(text, /\bcambia\s+(?:il\s+)?nome\b.+?\bin\b\s+(.+?)(?:\s*[,;.]|$)/i);
+  if (renameTo) edits.name = normalizeServiceName(renameTo);
+  const cat = textAfter(text, /\bcategoria\b\s*[:=]?\s*(?:in\s+|a\s+)?([^,;.\d][^,;.]*?)(?:\s+(?:e|prezzo|\u20ac|euro)\b|\s*[,;.]|$)/i) || textAfter(text, /\bsposta\b.+?\bnella categoria\b\s+(.+?)(?:\s*[,;.]|$)/i);
+  if (cat) edits.cat = normalizeServiceName(cat);
+  const amount = firstMoney(text);
+  if (Number.isFinite(amount) && /\b(prezzo|porta|imposta|costa|a\s+\d|\u20ac|euro|eur)\b/i.test(text)) edits.price = amount;
+  return edits;
+}
+function serviceCatalogRouter(text, ctx) {
+  const n = norm(text);
+  const svcWords = /\b(prestazione|prestazioni|voce listino|listino|farmaco|fiala|servizio)\b/;
+  const isRestore = /\b(ripristina|riattiva)\b/.test(n) && svcWords.test(n);
+  const isArchive = /\b(archivia|disattiva)\b/.test(n) && svcWords.test(n);
+  const isCreate = /\b(crea|aggiungi|nuova|nuovo|inserisci)\b/.test(n) && svcWords.test(n) && !/\bintervento\b/.test(n) && !/\ball'?intervento\b/.test(n);
+  const isDelete = /\b(elimina|cancella|rimuovi|togli)\b/.test(n) && svcWords.test(n) && !/\bintervento\b/.test(n) && !/\bprezzo (personalizzato|specifico)\b/.test(n);
+  const isRemoveCustom = /\b(togli|rimuovi|elimina|cancella)\b/.test(n) && /\bprezzo (personalizzato|specifico)\b/.test(n);
+  const amount = firstMoney(text);
+  const mentionsCompanyPrice = /\bper\s+\S+/.test(n) && Number.isFinite(amount);
+  const isUpdate = !isCreate && !isDelete && !isRestore && !isArchive && !isRemoveCustom && (
+    (/\b(modifica|cambia|aggiorna|correggi|imposta|metti|porta|rinomina|sposta)\b/.test(n) && (svcWords.test(n) || /\b(prezzo|categoria)\b/.test(n))) ||
+    /\brinomina\b/.test(n) ||
+    (Number.isFinite(amount) && /\b(porta|imposta|metti|aumenta|abbassa|correggi|cambia|modifica)\b/.test(n)) ||
+    (/\bprezzo\b/.test(n) && Number.isFinite(amount))
+  ) && !/\bintervento\b/.test(n) && !/\b(fattura|cliente|azienda agricola nuova)\b/.test(n);
+  if (!isCreate && !isDelete && !isUpdate && !isRestore && !isArchive && !isRemoveCustom) return null;
+  const scope = rvScope(ctx);
+
+  if (isCreate) {
+    let name = textAfter(text, /(?:crea|aggiungi|nuova|nuovo|inserisci)\s+(?:la\s+|una\s+|il\s+|un\s+)?(?:prestazione|voce listino|voce|farmaco|fiala|servizio)\s+(.+?)(?:\s+(?:al listino|a listino|in listino))?(?:\s*[,;.]|\s+(?:prezzo|categoria|a)\s+\d|\s+a\s+\d|$)/i);
+    if (name) name = name.replace(/\s+(?:a|prezzo)\s*$/i, '');
+    const cat = textAfter(text, /categoria\s*[:=]?\s*([^,;.\d][^,;.]*?)(?:\s+prezzo|\s*[,;.]|$)/i) || '';
+    const unit = textAfter(text, /\b(?:per|al)\s+(capo|animale|ora|visita|quintale|litro|dose)\b/i) || '';
+    const tipo = /\bfarmaco\b/.test(n) ? 'Farmaco' : (/\bfiala\b/.test(n) ? 'Fiala' : 'Prestazione');
+    const draft = { kind: 'service_create', draftId: newDraftId('svc'), name: normalizeServiceName(name), cat: normalizeServiceName(cat), tipo, unit: safeText(unit, 40), price: Number.isFinite(amount) ? amount : NaN, query: safeText(text, 400), awaiting: null };
+    if (draft.name) {
+      const dups = findServiceCandidates(draft.name, activeServices(ctx), { limit: 3 }).filter(c => c.score >= 55);
+      const exact = dups.find(d => norm(d.nome) === norm(draft.name));
+      if (exact) return response(`Esiste gi\u00e0 \u201c${exact.nome}\u201d a listino (${euro(exact.price)}). Non creo un duplicato.\nVuoi modificarla o creare comunque una voce con un altro nome?`, null, [`Porta ${exact.nome} a un nuovo prezzo`, 'Crea con altro nome', 'Annulla'], aiUi('service_action_wizard', null, null, false, { scope }));
+      if (dups.length) { draft.dupWarned = true; draft.dupNames = dups.map(d => d.nome); }
+    }
+    return serviceDraftReply(draft, ctx);
+  }
+
+  const pool = (isRestore) ? ctx.services : activeServices(ctx);
+  let candidates = findServiceCandidates(text, pool, { limit: 6 }).filter(c => c.score >= 30);
+  if (!candidates.length) {
+    const alias = serviceTextFromRequest(text);
+    if (alias) candidates = findServiceCandidates(alias, pool, { limit: 6 }).filter(c => c.score >= 30);
+  }
+  if (!candidates.length) {
+    if (svcWords.test(n) || isRemoveCustom) return response('Non trovo la voce di listino. Scrivimi il nome pi\u00f9 preciso della prestazione, del farmaco o della fiala.', null, ['Gestisci prestazioni'], aiUi('service_action_wizard', null, null, false, { scope }));
+    return null; // non era una richiesta sul listino: lascia rispondere gli altri handler
+  }
+  if (candidates.length > 1 && candidates[0].score - candidates[1].score < 10) {
+    return response('Ho trovato pi\u00f9 voci possibili:\n' + candidates.map((p, i) => `${i + 1}) ${p.nome}${serviceIsArchived(p) ? ' (archiviata)' : ''}${p.price ? ' \u00b7 ' + euro(p.price) : ''}`).join('\n') + '\nQuale devo usare? Rispondi col numero o col nome completo.', null, candidates.slice(0, 4).map(c => c.nome), aiUi('service_action_wizard', 'choice', null, false, { scope }));
+  }
+  const service = candidates[0];
+  const version = num(service.raw?._v, 0);
+
+  if (isRestore) {
+    if (!serviceIsArchived(service)) return response(`\u201c${service.nome}\u201d \u00e8 gi\u00e0 attiva a listino: non c'\u00e8 nulla da ripristinare.`, null, ['Gestisci prestazioni']);
+    return response(`Ho preparato il ripristino di \u201c${service.nome}\u201d: torner\u00e0 attiva a listino con gli stessi dati (${euro(service.price)}).\nScrivi SALVA per ripristinarla.`, { type: 'restore_service', serviceId: service.id, serviceName: service.nome, recordVersion: version, query: text }, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+  }
+
+  if (isRemoveCustom) {
+    const cRes = resolveCompany(text, ctx.companies, { allowWeak: true });
+    if (!cRes.match) return response('Per quale azienda devo togliere il prezzo personalizzato?', null, [], aiUi('service_action_wizard', 'company', null, false, { scope }));
+    const cur = cRes.match.raw?.prezzi?.[String(service.id)];
+    if (cur == null) return response(`${cRes.match.nome} non ha un prezzo personalizzato per \u201c${service.nome}\u201d: usa gi\u00e0 il listino base (${euro(service.price)}). Nulla da modificare.`, null, ['Gestisci prestazioni']);
+    return response(`Ho preparato la rimozione del prezzo personalizzato:\n${service.nome} \u00b7 ${cRes.match.nome}\nPRIMA: ${euro(cur)} (personalizzato)\nDOPO: ${euro(service.price)} (listino base)\nGli interventi gi\u00e0 salvati non cambiano.\nScrivi SALVA per confermare.`, { type: 'remove_company_price', serviceId: service.id, serviceName: service.nome, companyId: cRes.match.id, companyName: cRes.match.nome, before: { price: num(cur, 0) }, after: { price: service.price }, recordVersion: version, query: text }, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+  }
+
+  if (isDelete || isArchive) {
+    const usage = serviceUsage(ctx, service.id);
+    const consequences = [];
+    if (usage.interventions) consequences.push(`usata in ${usage.interventions} interventi (${usage.invoiced} fatturati, ${usage.unbilled} da fatturare)`);
+    if (usage.customPrices.length) consequences.push(`prezzi personalizzati per ${usage.customPrices.length} aziende (${usage.customPrices.slice(0, 3).map(c => c.nome).join(', ')}${usage.customPrices.length > 3 ? '\u2026' : ''})`);
+    if (isArchive || usage.used) {
+      const why = usage.used ? `Non la elimino fisicamente perch\u00e9 \u00e8 ${consequences.join(' e ')}: lo storico resterebbe illeggibile.` : '';
+      return response(`Ho preparato l'archiviazione di \u201c${service.nome}\u201d.\n${why}\nArchiviata: sparisce dalle scelte per i nuovi interventi, lo storico resta leggibile, potrai ripristinarla quando vuoi.\nScrivi SALVA per archiviarla.`, { type: 'archive_service', serviceId: service.id, serviceName: service.nome, usage: { interventions: usage.interventions, invoiced: usage.invoiced, customPrices: usage.customPrices.length }, recordVersion: version, query: text }, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+    }
+    const extra = usage.customPrices.length ? `\nVerranno rimossi anche i prezzi personalizzati collegati (${usage.customPrices.map(c => c.nome).join(', ')}).` : '';
+    return response(`\u201c${service.nome}\u201d non \u00e8 mai stata usata in interventi o fatture: posso eliminarla dal listino.${extra}\nL'eliminazione \u00e8 reversibile per 30 giorni (cestino).\nScrivi ELIMINA per confermare.`, { type: 'delete_service', serviceId: service.id, serviceName: service.nome, recordVersion: version, query: text }, actionButtons('delete'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+  }
+
+  // UPDATE
+  const edits = parseServiceEdits(text);
+  const cRes = /\bper\s+\S+|\bazienda\b|\bcliente\b/.test(n) ? resolveCompany(stripKnownWhenCompany(text), ctx.companies, { allowWeak: true }) : { match: null };
+  if (cRes.match && Number.isFinite(edits.price)) {
+    const sid = String(service.id);
+    const cur = cRes.match.raw?.prezzi?.[sid];
+    const curEff = cur != null ? num(cur, 0) : service.price;
+    if (num(cur, -1) === edits.price) return response(`\u00c8 gi\u00e0 impostato cos\u00ec: ${cRes.match.nome} paga \u201c${service.nome}\u201d ${euro(edits.price)} (prezzo personalizzato). Nessuna modifica necessaria.`, null, ['Gestisci prestazioni']);
+    return response(`Ho preparato il prezzo personalizzato:\n${service.nome} \u00b7 ${cRes.match.nome}\nPRIMA: ${euro(curEff)}${cur != null ? ' (personalizzato)' : ' (listino base)'}\nDOPO: ${euro(edits.price)} (personalizzato)\nIl listino base resta ${euro(service.price)}; gli interventi gi\u00e0 salvati non cambiano.\nScrivi SALVA per confermare.`, { type: 'update_service', serviceId: service.id, serviceName: service.nome, companyId: cRes.match.id, companyName: cRes.match.nome, fields: { price: edits.price }, before: { price: curEff }, after: { price: edits.price }, recordVersion: version, query: text }, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+  }
+  const before = {}; const after = {};
+  if (edits.name && edits.name !== service.nome) { before.name = service.nome; after.name = edits.name; }
+  if (edits.cat && norm(edits.cat) !== norm(service.cat || '')) { before.cat = service.cat || '\u2014'; after.cat = edits.cat; }
+  if (Number.isFinite(edits.price) && edits.price !== service.price) { before.price = service.price; after.price = edits.price; }
+  const noopParts = [];
+  if (edits.name && after.name === undefined) noopParts.push(`si chiama gi\u00e0 \u201c${service.nome}\u201d`);
+  if (edits.cat && after.cat === undefined) noopParts.push(`\u00e8 gi\u00e0 nella categoria ${service.cat}`);
+  if (Number.isFinite(edits.price) && after.price === undefined) noopParts.push(`costa gi\u00e0 ${euro(service.price)}`);
+  if (!Object.keys(after).length) {
+    if (noopParts.length) return response(`\u00c8 gi\u00e0 impostato cos\u00ec: \u201c${service.nome}\u201d ${noopParts.join(' e ')}. Nessuna modifica necessaria.`, null, ['Gestisci prestazioni']);
+    return response(`Cosa devo modificare di \u201c${service.nome}\u201d? Posso cambiare prezzo, nome o categoria, oppure impostare un prezzo personalizzato per un'azienda.`, null, ['Modifica prezzo', 'Rinomina', 'Cambia categoria', 'Prezzo personalizzato'], aiUi('service_action_wizard', 'fields', null, false, { scope }));
+  }
+  const usage = serviceUsage(ctx, service.id);
+  const lines = [];
+  if (after.name) lines.push(`Nome: ${before.name} \u2192 ${after.name}`);
+  if (after.cat) lines.push(`Categoria: ${before.cat} \u2192 ${after.cat}`);
+  if (after.price !== undefined) lines.push(`Prezzo di listino: ${euro(before.price)} \u2192 ${euro(after.price)}`);
+  const impact = [];
+  if (after.price !== undefined && usage.customPrices.length) impact.push(`${usage.customPrices.length} aziende con prezzo personalizzato NON cambiano (${usage.customPrices.slice(0, 3).map(c => c.nome).join(', ')}${usage.customPrices.length > 3 ? '\u2026' : ''})`);
+  if (after.price !== undefined) impact.push('vale per i nuovi interventi; interventi e fatture gi\u00e0 salvati restano invariati');
+  const fields = {}; if (after.name) fields.name = after.name; if (after.cat) fields.cat = after.cat; if (after.price !== undefined) fields.price = after.price;
+  return response(`Ho preparato la modifica al listino:\n${service.nome}\n${lines.join('\n')}${impact.length ? '\nImpatto: ' + impact.join('; ') + '.' : ''}\nScrivi SALVA per applicare.`, { type: 'update_service', serviceId: service.id, serviceName: service.nome, fields, before, after, recordVersion: version, query: text }, actionButtons('save'), aiUi('service_action_wizard', 'confirmation', null, false, { scope }));
+}
+
+/* ================================================================== */
+/* RV9 · PRESTAZIONI DENTRO GLI INTERVENTI (operazioni di riga)       */
+/* add / setQty / removeUnit / removeLine / replace / replacePartial  */
+/* / setPrice, con fusione righe uguali e ricalcolo totali. La        */
+/* simulazione applyLineOps è pura e condivisa con i test.            */
+/* ================================================================== */
+
+function applyLineOps(rows, ops) {
+  const out = rows.map(r => ({ id: String(r.id), nome: r.nome, qty: Math.max(1, num(r.qty, 1)), price: num(r.price, 0) }));
+  const notes = [];
+  const findIdx = sid => out.findIndex(r => r.id === String(sid));
+  for (const op of ops || []) {
+    const idx = op.serviceId != null ? findIdx(op.serviceId) : -1;
+    if (op.op === 'add') {
+      if (idx >= 0) { out[idx].qty += Math.max(1, num(op.qty, 1)); notes.push(`+${num(op.qty, 1)} ${out[idx].nome} (riga esistente aggiornata)`); }
+      else { out.push({ id: String(op.serviceId), nome: op.serviceName || '', qty: Math.max(1, num(op.qty, 1)), price: num(op.price, 0) }); notes.push(`aggiunta ${op.serviceName || ''} x${num(op.qty, 1)}`); }
+    } else if (op.op === 'setQty' && idx >= 0) { out[idx].qty = Math.max(1, num(op.qty, 1)); }
+    else if (op.op === 'removeUnit' && idx >= 0) {
+      const q = Math.max(1, num(op.qty, 1));
+      if (out[idx].qty > q) out[idx].qty -= q; else { notes.push(`riga ${out[idx].nome} rimossa (quantit\u00e0 esaurita)`); out.splice(idx, 1); }
+    }
+    else if (op.op === 'removeLine' && idx >= 0) { notes.push(`riga ${out[idx].nome} rimossa`); out.splice(idx, 1); }
+    else if ((op.op === 'replace' || op.op === 'replacePartial') && idx >= 0) {
+      const moveQty = op.op === 'replace' ? out[idx].qty : Math.min(out[idx].qty, Math.max(1, num(op.qty, 1)));
+      out[idx].qty -= moveQty;
+      const toIdx = findIdx(op.toServiceId);
+      if (toIdx >= 0) { out[toIdx].qty += moveQty; notes.push(`quantit\u00e0 sommate sulla riga ${out[toIdx].nome}`); }
+      else out.push({ id: String(op.toServiceId), nome: op.toServiceName || '', qty: moveQty, price: num(op.toPrice, 0) });
+      if (out[idx].qty <= 0) out.splice(idx, 1);
+    }
+    else if (op.op === 'setPrice' && idx >= 0) { out[idx].price = num(op.price, 0); }
+  }
+  // fusione righe uguali
+  const merged = [];
+  for (const r of out) {
+    const same = merged.find(m => m.id === r.id && m.price === r.price);
+    if (same) { same.qty += r.qty; notes.push(`righe ${r.nome} uguali fuse`); } else merged.push(r);
+  }
+  merged.forEach(r => { r.total = Math.round(r.qty * r.price * 100) / 100; });
+  return { rows: merged, total: Math.round(merged.reduce((s, r) => s + r.total, 0) * 100) / 100, notes };
+}
+
+function parseLineOps(text, ctx) {
+  const n = norm(text);
+  const ops = [];
+  const svc = raw => { const c = findServiceCandidates(raw, activeServices(ctx), { limit: 2 }); return c.length && c[0].score >= 30 ? c[0] : null; };
+
+  let m = safeText(text).match(/\bsostituisci\s+(?:una?|1)\s+(?:delle?\s+(?:due|tre|\d+)\s+)?(.+?)\s+con\s+(?:una?\s+|il\s+|la\s+)?(.+?)\s*$/i);
+  if (m) {
+    const from = svc(m[1]); const to = svc(m[2]);
+    if (from && to && String(from.id) !== String(to.id)) { ops.push({ op: 'replacePartial', serviceId: from.id, qty: 1, toServiceId: to.id, toServiceName: to.nome, toPrice: to.price }); return ops; }
+  }
+  m = safeText(text).match(/\b(?:cambia|sostituisci|trasforma|converti)\b(?:\s+(?:il|la|lo|l['\u2019]|tutt[ei]\s+l[ei]))?\s+(.+?)\s+(?:in|con)\s+(?:una?\s+|il\s+|la\s+)?(.+?)\s*$/i);
+  if (m) {
+    const from = svc(m[1]); const to = svc(m[2]);
+    if (from && to && String(from.id) !== String(to.id)) { ops.push({ op: 'replace', serviceId: from.id, toServiceId: to.id, toServiceName: to.nome, toPrice: to.price }); return ops; }
+  }
+  m = safeText(text).match(/\bporta\s+(?:le?\s+|gli\s+|i\s+)?(.+?)\s+(?:da\s+\S+\s+)?a\s+(\d+|\w+)\b/i);
+  if (m && !/euro|\u20ac/.test(String(m[2]))) {
+    const s = svc(m[1]); const q = Number(m[2]) || wordQty(norm(m[2]));
+    if (s && q) { ops.push({ op: 'setQty', serviceId: s.id, qty: q }); return ops; }
+  }
+  m = safeText(text).match(/\b(?:correggi|metti|imposta|cambia)\b.*\bprezzo\b(?:\s+(?:del(?:la)?|di))?\s+(.+?)\s+(?:in questo intervento\s+)?a\s+(\d+(?:[.,]\d+)?)/i);
+  if (m) {
+    const s = svc(m[1]);
+    if (s) { ops.push({ op: 'setPrice', serviceId: s.id, price: Number(String(m[2]).replace(',', '.')) }); return ops; }
+  }
+  m = safeText(text).match(/\b(?:togli|rimuovi|elimina|leva)\s+(una?|1|due|2|tre|3)\s+(.+?)(?:\s+dall|$|[,;.])/i);
+  if (m) {
+    const s = svc(m[2]); const q = Number(m[1]) || wordQty(norm(m[1])) || 1;
+    if (s) { ops.push({ op: 'removeUnit', serviceId: s.id, qty: q }); return ops; }
+  }
+  m = safeText(text).match(/\b(?:togli|rimuovi|elimina|leva)\s+(?:la\s+|le\s+|il\s+|i\s+|gli\s+|tutte le\s+)?(.+?)(?:\s+dall'?intervento|\s+dall|,|;|\.|$)/i);
+  if (m && /\b(togli|rimuovi|elimina|leva)\b/.test(n) && !/\bintervento\s*$/.test(norm(m[1]))) {
+    const s = svc(m[1]);
+    if (s) { ops.push({ op: 'removeLine', serviceId: s.id }); return ops; }
+  }
+  m = safeText(text).match(/\baggiungi\s+(una?|1|due|2|tre|3|quattro|4|cinque|5)?\s*(.+?)\s+(?:all'?intervento|all\b|$)/i);
+  if (m && /\baggiungi\b/.test(n) && /\bintervento\b/.test(n)) {
+    const s = svc(m[2]); const q = m[1] ? (Number(m[1]) || wordQty(norm(m[1])) || 1) : 1;
+    if (s) { ops.push({ op: 'add', serviceId: s.id, serviceName: s.nome, qty: q, price: s.price }); return ops; }
+  }
+  return ops;
+}
+
+function lineOpsBeforeAfter(target, ops, ctx) {
+  const priced = ops.map(op => {
+    const o = { ...op };
+    const row = (target.prestazioni || []).find(p => String(p.id) === String(op.serviceId));
+    if (op.op === 'add' && !o.price) {
+      const c = ctx.companies.find(x => String(x.id) === String(target.aziendaId));
+      const custom = c?.raw?.prezzi?.[String(op.serviceId)];
+      const cat = ctx.services.find(s => String(s.id) === String(op.serviceId));
+      o.price = custom != null ? num(custom, 0) : num(cat?.price, 0);
+    }
+    if ((op.op === 'replace' || op.op === 'replacePartial') && !o.toPrice) {
+      const c = ctx.companies.find(x => String(x.id) === String(target.aziendaId));
+      const custom = c?.raw?.prezzi?.[String(op.toServiceId)];
+      const cat = ctx.services.find(s => String(s.id) === String(op.toServiceId));
+      o.toPrice = custom != null ? num(custom, 0) : num(cat?.price, 0);
+    }
+    if (row && !o.serviceName) o.serviceName = row.nome;
+    return o;
+  });
+  const before = (target.prestazioni || []).map(p => ({ id: String(p.id), nome: p.nome, qty: p.qty, price: p.price, total: Math.round(p.qty * p.price * 100) / 100 }));
+  const beforeTotal = Math.round(before.reduce((s, r) => s + r.total, 0) * 100) / 100;
+  const sim = applyLineOps(before, priced);
+  return { ops: priced, before: { rows: before, total: beforeTotal }, after: { rows: sim.rows, total: sim.total }, notes: sim.notes };
+}
+function lineOpsRelevant(items, ops) {
+  const ids = ops.filter(o => o.op !== 'add').map(o => String(o.serviceId));
+  if (!ids.length) return items;
+  const withAll = items.filter(i => ids.every(id => (i.prestazioni || []).some(p => String(p.id) === id)));
+  return withAll.length ? withAll : items;
+}
+function formatBeforeAfter(ba) {
+  const line = r => `- ${r.nome} x${r.qty}: ${euro(r.total)}`;
+  return `PRIMA\n${ba.before.rows.map(line).join('\n') || '- (nessuna prestazione)'}\nTotale: ${euro(ba.before.total)}\n\nDOPO\n${ba.after.rows.map(line).join('\n') || '- (nessuna prestazione)'}\nTotale: ${euro(ba.after.total)}${ba.notes.length ? '\nNota: ' + [...new Set(ba.notes)].join('; ') + '.' : ''}`;
+}
+
 app.get('/', (req, res) => res.json({ ok: true, name: 'Rural Vet AI backend', version: VERSION, model: MODEL }));
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'rural-vet-ai', version: VERSION, model: MODEL, time: new Date().toISOString() }));
+
+/* RV9 · login: valida contro il registro server (base) o i collaboratori nel DB cloud. */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const userId = safeText(req.body?.userId, 80).toLowerCase().trim();
+    const password = safeText(req.body?.password, 200);
+    if (!userId || !password) return res.status(400).json({ ok: false, error: 'missing_credentials' });
+    let user = null;
+    const base = rvRegistryUser(userId);
+    if (base && sha256Hex(password) === base.passHash) user = base;
+    if (!user && DB_PROXY_READY) {
+      try {
+        const r = await fetch(`https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}/latest`, { headers: { 'X-Master-Key': JSONBIN_API_KEY } });
+        const j = await r.json();
+        const coll = asArray(j?.record?.cfg?.collaboratori).find(c => String(c.id || '').toLowerCase() === userId);
+        if (coll && (String(coll.pass || '') === password || coll.passHash === sha256Hex(password))) {
+          user = { id: userId, name: safeText(coll.name, 140) || userId, role: 'worker', aiAccess: false };
+        }
+      } catch (e) { console.warn('[RV9] login: verifica collaboratori non riuscita:', e.message); }
+    }
+    if (!user) return res.status(401).json({ ok: false, error: 'invalid_credentials', reply: 'Credenziali non valide.' });
+    return res.json({ ok: true, token: rvMakeToken(user), user: { id: user.id, name: user.name, role: user.role }, aiAccess: !!user.aiAccess, expiresInMs: RV_TOKEN_TTL_MS });
+  } catch (err) {
+    console.error('Errore /api/auth/login', err);
+    return res.status(500).json({ ok: false, error: 'login_failed' });
+  }
+});
+app.get('/api/auth/me', (req, res) => {
+  const p = rvVerifyToken(rvTokenFromReq(req));
+  if (!p) return res.status(401).json({ ok: false });
+  res.json({ ok: true, user: { id: p.uid, name: p.name, role: p.role }, aiAccess: !!p.ai, exp: p.exp });
+});
 
 // ---------------------------------------------------------------------------
 // Cloud DB proxy (v8.9): la chiave JSONBin sta SOLO qui, in variabili ambiente.
@@ -2291,7 +2934,7 @@ app.get('/api/db/ping', (req, res) => {
   res.json({ ok: true, configured: DB_PROXY_READY, version: VERSION });
 });
 
-app.get('/api/db/load', async (req, res) => {
+app.get('/api/db/load', requireAuth, async (req, res) => {
   if (!DB_PROXY_READY) return res.status(503).json({ ok: false, error: 'Cloud DB non configurato sul backend (JSONBIN_BIN_ID / JSONBIN_API_KEY mancanti).' });
   try {
     const r = await fetch(`https://api.jsonbin.io/v3/b/${encodeURIComponent(JSONBIN_BIN_ID)}/latest`, { headers: { 'X-Master-Key': JSONBIN_API_KEY } });
@@ -2305,7 +2948,7 @@ app.get('/api/db/load', async (req, res) => {
   }
 });
 
-app.post('/api/db/save', async (req, res) => {
+app.post('/api/db/save', requireAuth, async (req, res) => {
   if (!DB_PROXY_READY) return res.status(503).json({ ok: false, error: 'Cloud DB non configurato sul backend (JSONBIN_BIN_ID / JSONBIN_API_KEY mancanti).' });
   try {
     const record = req.body && req.body.db ? req.body.db : req.body;
@@ -2321,16 +2964,16 @@ app.post('/api/db/save', async (req, res) => {
   }
 });
 
-app.post('/api/debug-context', (req, res) => {
-  const ctx = buildContext(req.body || {});
+app.post('/api/debug-context', requireAi, (req, res) => {
+  const ctx = buildContext(req.body || {}, req.rvUser);
   res.json({ ok: true, version: VERSION, counts: { users: ctx.users.length, companies: ctx.companies.length, services: ctx.services.length, interventions: ctx.interventions.length, invoices: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser, sampleCompanies: ctx.companies.slice(0, 5).map(c => c.nome), sampleServices: ctx.services.slice(0, 5).map(s => s.nome), sampleInterventions: ctx.interventions.slice(0, 3), sampleInvoices: ctx.invoices.slice(0, 3) });
 });
 
-app.post('/api/vet-ai-chat', async (req, res) => {
+app.post('/api/vet-ai-chat', requireAi, async (req, res) => {
   try {
     const body = req.body || {};
     const text = safeText(body.input, MAX_INPUT_CHARS);
-    const ctx = buildContext(body);
+    const ctx = buildContext(body, req.rvUser);
     if (!text.trim()) return res.json({ reply: 'Scrivimi cosa vuoi sapere o fare nel gestionale.', action: null, actions: [], learn: [], source: 'empty' });
 
     let result = deterministicRouter(text, ctx);
@@ -2357,7 +3000,8 @@ app.post('/api/vet-ai-chat', async (req, res) => {
 
     result = validateAction(result, ctx);
     if (String(process.env.AI_DEBUG || '').toLowerCase() === 'true') console.log('[AI_DEBUG]', JSON.stringify({ input:text, source, awaiting:result.ui?.awaiting || null, draftId:result.ui?.draftId || '', actionType:result.action?.type || '', safeToApply:!!result.ui?.safeToApply, counts:{companies:ctx.companies.length, services:ctx.services.length} }));
-    res.json({ reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: result.ui || aiUi(), chart: result.chart || result.ui?.chart || null, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v8', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
+    const uiOut = Object.assign({}, result.ui || aiUi(), { scope: (result.ui && result.ui.scope) || rvScope(ctx) });
+    res.json({ ok: result.ok !== false, reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), data: result.data || null, action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: uiOut, chart: result.chart || result.ui?.chart || null, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v9', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
     res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
@@ -2371,4 +3015,4 @@ app.post(['/api/ai', '/api/chat'], (req, res, next) => {
 
 if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
 
-export { app, buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates };
+export { app, buildContext, deterministicRouter, parseInterventionDraft, continuePendingInterventionDraft, validateInterventionAction, findServiceCandidates, findCompanyCandidates, parsePeriod, collectKmRows, kmStats, kmAnalyticsQuery, serviceCatalogRouter, continueServiceDraft, applyLineOps, parseLineOps, updateInterventionRequest, signDraft, readSignedDraft, rvMakeToken, rvVerifyToken, requireAi, enforceUserScope };

@@ -1,435 +1,421 @@
-import fs from 'fs';
-import { execFileSync } from 'child_process';
+// Rural Vet AI v9 — test comportamentali end-to-end.
+// Niente più assert sulle stringhe del sorgente: qui si testano router,
+// motore KM, catalogo prestazioni, operazioni di riga e autorizzazioni
+// con un dataset realistico e chiamate HTTP vere all'endpoint.
+import assert from 'node:assert/strict';
+import {
+  app, buildContext, deterministicRouter, parsePeriod, collectKmRows, kmStats,
+  kmAnalyticsQuery, serviceCatalogRouter, continueServiceDraft, applyLineOps,
+  updateInterventionRequest, signDraft, readSignedDraft, rvMakeToken, rvVerifyToken
+} from './server.js';
 
-function assert(cond, msg) { if (!cond) throw new Error(msg); }
-function check(cmd, args) { execFileSync(cmd, args, { stdio: 'pipe' }); }
-
-const here = new URL('.', import.meta.url);
-function existing(...names) { for (const name of names) { const u = new URL(name, here); if (fs.existsSync(u)) return u; } throw new Error('File non trovato: ' + names.join(' / ')); }
-const serverUrl = existing('./server.js', './rural-vet-server-ai-analytics-interventions.js');
-const htmlUrl = existing('./index.html', './rural-vet-index-ai-analytics-interventions.html');
-const server = fs.readFileSync(serverUrl, 'utf8');
-const html = fs.readFileSync(htmlUrl, 'utf8');
-
-check(process.execPath, ['--check', serverUrl.pathname]);
-const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
-for (const script of scripts) new Function(script);
-
-[
-  'parseInterventionDraft',
-  'findServiceCandidates',
-  'findCompanyCandidates',
-  'continuePendingInterventionDraft',
-  'validateInterventionAction',
-  'resolveNextInterventionStep',
-  'interventionDraftToReply'
-].forEach(name => assert(server.includes('function ' + name), 'Manca funzione ' + name));
-
-assert(server.includes("type: 'continue_intervention_draft'"), 'Manca action continue_intervention_draft');
-assert(server.includes('safeToApply'), 'Manca contratto safeToApply');
-assert(server.includes('AI_DEBUG'), 'Manca AI_DEBUG');
-assert(html.includes('pendingInterventionDraft'), 'Frontend non mantiene pendingInterventionDraft');
-assert(html.includes('ctx.pendingInterventionDraft'), 'Frontend non invia pendingInterventionDraft nel context');
-assert(html.includes("continue_intervention_draft"), 'Frontend non gestisce continue_intervention_draft');
-assert(html.includes("Modifica prestazione"), 'Mancano bottoni modifica bozza');
-
-assert(server.includes('draftProgressLine'), 'Manca progress line wizard intervento');
-assert(server.includes('buildQuantityChoiceReply'), 'Manca step modifica quantità');
-assert(server.includes("Aggiungi prestazione"), 'Manca bottone aggiungi prestazione');
-assert(html.includes('interventionDraftQuickReplies'), 'Frontend non genera quick replies dinamiche per bozza');
-assert(html.includes("Modifica quantità"), 'Manca bottone modifica quantità frontend');
-assert(server.includes('chartResponse'), 'Manca generazione grafici AI backend');
-assert(server.includes('ui.chart') || server.includes('{ chart }'), 'Manca contratto ui.chart/chart');
-assert(html.includes('chartHtml'), 'Frontend non renderizza grafici AI');
-assert(html.includes('lastAiChart'), 'Frontend non conserva grafico AI ultimo messaggio');
-assert(server.includes('KPI periodo'), 'Mancano quick replies KPI analytics');
-assert(server.includes('ruralVetAiBriefingQuery'), 'Manca briefing gestionale Rural Vet AI');
-assert(server.includes('managementInsights'), 'Mancano insight gestionali Rural Vet AI');
-assert(server.includes('dataQualityQuery'), 'Manca controllo qualità dati Rural Vet AI');
-assert(server.includes('inactiveClientsQuery'), 'Manca analisi clienti fermi Rural Vet AI');
-assert(server.includes('nextActionsQuery'), 'Manca motore priorità operative Rural Vet AI');
-assert(server.includes('priorityTasks'), 'Manca generatore priorità Rural Vet AI');
-assert(server.includes('Sei Rural Vet AI'), 'Prompt backend non nomina Rural Vet AI');
-assert(html.includes('Rural Vet AI'), 'Frontend non mostra Rural Vet AI');
-assert(html.includes('Controllo dati mancanti'), 'Mancano quick replies qualità dati frontend');
-assert(html.includes('Clienti fermi'), 'Mancano quick replies clienti fermi frontend');
-assert(!html.includes('>AI</') && !html.includes('content:"AI"'), 'Rimane una label AI generica visibile');
-
-assert(server.includes('auditGestionaleQuery'), 'Manca audit gestionale Rural Vet AI v8.5');
-assert(server.includes('businessHealthScore'), 'Manca score salute gestionale v8.5');
-assert(server.includes('cashflowQuery'), 'Manca cash flow Rural Vet AI v8.5');
-assert(server.includes('interventionAnomaliesQuery'), 'Manca controllo anomalie interventi v8.5');
-assert(server.includes('listinoQualityQuery'), 'Manca controllo qualità listino v8.5');
-assert(server.includes('smartSuggestionsQuery'), 'Manca motore suggerimenti operativi v8.5');
-assert(html.includes('rvAiInsightGrid'), 'Frontend non renderizza card insight v8.5');
-assert(html.includes('lastAiInsights'), 'Frontend non conserva insight Rural Vet AI v8.5');
-assert(html.includes('Audit gestionale'), 'Mancano quick replies audit frontend v8.5');
-assert(html.includes('Cash flow'), 'Mancano quick replies cash flow frontend v8.5');
-assert(html.includes('Anomalie interventi'), 'Mancano quick replies anomalie frontend v8.5');
-
-
-
-assert(server.includes('8.12.0-paste-and-go-ai-hardening'), 'Versione server non aggiornata a v8.12');
-assert(server.includes('ruralVetAiCockpitQuery'), 'Manca cockpit operativo Rural Vet AI v8.6');
-assert(server.includes('dailyClosureQuery'), 'Manca chiusura giornata Rural Vet AI v8.6');
-assert(server.includes('monthProjectionQuery'), 'Manca proiezione mese Rural Vet AI v8.6');
-assert(server.includes('uploadPreflightQuery'), 'Manca preflight caricamento Rural Vet AI v8.6');
-assert(server.includes('operationalCards'), 'Mancano card operative consolidate v8.6');
-assert(html.includes('greetingInsights'), 'Manca funzione greetingInsights v8.6');
-assert(html.includes('rv-vet-ai-v86-style'), 'Manca restyling grafico v8.6');
-assert(html.includes('rvAiChartHeader'), 'Manca header grafico v8.6');
-assert(html.includes('Cockpit Rural Vet AI'), 'Mancano quick replies cockpit frontend v8.6');
-assert(html.includes('Proiezione mese'), 'Manca proiezione mese frontend v8.6');
-assert(html.includes('Chiusura giornata'), 'Manca chiusura giornata frontend v8.6');
-assert(server.includes('kmRowsFromContext'), 'Manca fallback KM da tratte/interventi v8.7');
-assert(server.includes('kmEfficiencyQuery'), 'Manca efficienza KM Rural Vet AI v8.7');
-assert(server.includes('performanceVeterinariQuery'), 'Manca performance veterinari Rural Vet AI v8.7');
-assert(server.includes('weeklyDigestQuery'), 'Manca report settimanale/mensile Rural Vet AI v8.7');
-assert(server.includes('ruralVetAiSelfTestQuery'), 'Manca diagnostica Rural Vet AI v8.7');
-assert(html.includes('rv-vet-ai-v87-style'), 'Manca restyling grafico v8.7');
-assert(html.includes('rvAiScoreMeter'), 'Manca score meter grafico v8.7');
-assert(html.includes('rvAiChartStats'), 'Manca riepilogo statistiche grafico v8.7');
-assert(html.includes('Efficienza KM'), 'Manca quick reply Efficienza KM v8.7');
-assert(html.includes('Performance veterinari'), 'Manca quick reply Performance veterinari v8.7');
-assert(html.includes('Diagnostica Rural Vet AI'), 'Manca diagnostica frontend v8.7');
-assert(html.includes('rv-vet-ai-v88-style'), 'Manca restyling v8.8 compatto/leggibile');
-assert(html.includes('mainRuralVetAiQuickReplies'), 'Manca set ridotto di quick replies iniziali v8.8');
-assert(html.includes("return ['Cockpit Rural Vet AI','Inserisci intervento','Grafico ricavi'];"), 'Le quick replies iniziali non sono state ridotte a tre');
-assert(html.includes('return [];') && html.includes('welcome volutamente compatto'), 'La welcome iniziale mostra ancora card pesanti');
-assert(html.includes('#0b2845') && html.includes('#0f5d73'), 'Manca palette petrolio/blu v8.8');
-
-
-
-// --- v8.12: controlli statici robustezza ---
-assert(server.includes('smallTalkQuery'), 'Manca smallTalkQuery v8.12');
-assert(server.includes('dopodomani'), 'Mancano date estese v8.12');
-assert(server.includes('openai-missing-key'), 'Manca degradazione senza chiave OpenAI v8.12');
-assert(html.includes("textContent = 'Riprova'"), 'Manca bottone Riprova v8.12');
-
-// --- v8.11: controlli statici interfaccia AI pro ---
-assert(html.includes('rv-v811-ai-pro-style') && html.includes('rv-v811-ai-pro-script'), 'Manca patch interfaccia AI v8.11');
-assert(html.includes('rvAiScrollDown'), 'Manca scroll-to-bottom v8.11');
-assert(html.includes('rvAiStatus'), 'Manca stato connessione header v8.11');
-assert(html.includes('rvMsgTools'), 'Manca copia messaggio v8.11');
-
-// --- v8.10: controlli statici UX + sostituzione prestazione ---
-assert(html.includes('rv-v810-ux-style') && html.includes('rv-v810-ux-script'), 'Manca patch UX v8.10');
-assert(html.includes('rvToast'), 'Manca sistema toast v8.10');
-assert(html.includes('replaceService'), 'Frontend senza supporto replaceService');
-assert(server.includes('replaceService'), 'Backend senza supporto replaceService');
-assert(server.includes('interventionUpdateLabel'), 'Backend senza etichette italiane per le modifiche');
-
-// --- v8.9: controlli statici nuovi ---
-assert(server.includes("'/api/db/load'") && server.includes("'/api/db/save'") && server.includes("'/api/db/ping'"), 'Mancano gli endpoint proxy cloud /api/db/*');
-assert(server.includes('JSONBIN_API_KEY') && server.includes('process.env.JSONBIN_API_KEY'), 'La chiave JSONBin non è letta da env');
-assert(html.includes('rv-cloud-proxy-patch-v89'), 'Frontend senza patch proxy cloud v8.9');
-assert(html.includes('Nessun intervento da fatturare per questo cliente.'), 'Manca guardia emitFatt su fattura vuota');
-
-// --- v8.9: test FUNZIONALI (eseguono davvero il router con dati finti) ---
-async function functionalTests() {
-  let mod;
-  try {
-    mod = await import(new URL('./server.js', import.meta.url).href);
-  } catch (err) {
-    console.log('ATTENZIONE: test funzionali saltati (dipendenze non installate: esegui `npm install`). Dettaglio: ' + err.message);
-    return;
-  }
-  const today = new Date();
-  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  const oggi = iso(today);
-  const ieri = iso(new Date(today.getTime() - 86400000));
-  const body = { context: {
-    user: { id:'medardo', name:'Medardo Cammi', role:'worker' },
-    users: [{id:'medardo',name:'Medardo Cammi',role:'worker'}],
-    aziende: [
-      {id:1,nome:'Rossi',ragioneSociale:'Az. Agr. Rossi',piva:'12345678901',comune:'Piacenza',km:18},
-      {id:2,nome:'Verdi',ragioneSociale:'Soc. Agr. Verdi',comune:'Lodi',km:32}
-    ],
-    prestazioni: [
-      {id:10,nome:'Cesareo',price:300},{id:11,nome:'Fecondazione',price:25},{id:12,nome:'Visita clinica',price:50}
-    ],
-    interventi: [
-      {id:100,data:oggi,ora:'08:30',userId:'medardo',aziendaId:1,azienda:'Rossi',tot:350,fatt:false,prestazioni:[{id:10,nome:'Cesareo',qty:1,price:300},{id:11,nome:'Fecondazione',qty:2,price:25}]},
-      {id:101,data:ieri,ora:'15:00',userId:'medardo',aziendaId:2,azienda:'Verdi',tot:50,fatt:true,prestazioni:[{id:12,nome:'Visita clinica',qty:1,price:50}]}
-    ],
-    fatture: [ {id:200,num:9,azId:2,azienda:'Verdi',data:ieri,tot:61,imponibile:50,iva:11,pagata:false,scadenza:ieri} ],
-    km: [ {data:oggi,userId:'medardo',km:44,azienda:'Rossi'} ]
-  }};
-  const ctx = mod.buildContext(body);
-  assert(ctx.interventions.length === 2, 'buildContext non ingerisce gli interventi');
-  assert(ctx.companies.length === 2 && ctx.services.length === 3 && ctx.invoices.length === 1 && ctx.kmRoutes.length === 1, 'buildContext: conteggi contesto errati');
-
-  // alias inglese "interventions" (robustezza contratto)
-  const ctxEn = mod.buildContext({ context: { ...body.context, interventi: undefined, interventions: body.context.interventi } });
-  assert(ctxEn.interventions.length === 2, 'Alias context.interventions non accettato');
-
-  const ask = t => mod.deterministicRouter(t, ctx);
-
-  // KPI ricavi oggi (cifra esatta attesa: 350 €)
-  const ricavi = ask('Quanti ricavi ho fatto oggi?');
-  assert(ricavi && /350,00/.test(ricavi.reply), 'Ricavi oggi errati: ' + (ricavi && ricavi.reply));
-
-  // Regression v8.9: i KM non devono più essere dirottati su "Non trovo quel cliente"
-  const km = ask('Km percorsi oggi');
-  assert(km && !/non trovo quel cliente/i.test(km.reply), 'Regressione: query KM dirottata su clientLookup');
-  assert(/44/.test(km.reply), 'KM oggi errati: ' + (km && km.reply).slice(0,120));
-
-  // Regression v8.9: "P.IVA di Rossi" deve rispondere con la P.IVA, non coi ricavi
-  const piva = ask('P.IVA di Rossi');
-  assert(piva && /12345678901/.test(piva.reply), 'P.IVA di Rossi non risolta: ' + (piva && piva.reply).slice(0,120));
-
-  // Top clienti (ordine e importi)
-  const top = ask('Top clienti questo mese');
-  assert(top && top.reply.indexOf('Rossi') < top.reply.indexOf('Verdi') && /350,00/.test(top.reply), 'Top clienti errata');
-
-  // Fatture scadute
-  const scad = ask('Fatture scadute');
-  assert(scad && /61,00/.test(scad.reply) && /n\.?9/.test(scad.reply.replace(/\s/g,'')), 'Fatture scadute errate');
-
-  // Wizard intervento completo: azione pronta e sicura
-  const wiz = ask('Ho fatto un cesareo e due fecondazioni da Rossi oggi alle 14:30');
-  assert(wiz && wiz.action && wiz.action.type === 'create_intervention', 'Wizard non produce create_intervention');
-  assert(wiz.ui && wiz.ui.safeToApply === true, 'Wizard: safeToApply dovrebbe essere true con dati completi');
-  assert(/350,00/.test(wiz.reply), 'Wizard: totale stimato errato');
-  const val = mod.validateInterventionAction(wiz.action, ctx);
-  assert(val && val.ok !== false, 'validateInterventionAction boccia un intervento valido');
-
-  // Wizard con azienda ambigua/mancante: NON deve essere safeToApply
-  const wiz2 = ask('Ho fatto una visita clinica da Brambilla oggi alle 10:00');
-  assert(wiz2 && (!wiz2.ui || wiz2.ui.safeToApply !== true), 'Wizard: safeToApply true con cliente inesistente');
-
-  // v8.10: "cambia il cesareo in visita clinica" → sostituzione puntuale con etichetta italiana
-  const swap = ask('Cambia il cesareo di Rossi in visita clinica');
-  assert(swap && swap.action && swap.action.type === 'update_intervention', 'Sostituzione prestazione non riconosciuta');
-  assert(swap.action.updates && swap.action.updates.replaceService && String(swap.action.updates.replaceService.fromId) === '10' && String(swap.action.updates.replaceService.toId) === '12', 'replaceService ids errati');
-  assert(/Prestazione: Cesareo → Visita clinica/.test(swap.reply), 'Etichetta italiana sostituzione mancante');
-
-  // v8.10: modifica senza cambiamenti reali → risposta onesta, nessuna azione
-  const noop = ask("Segna l'intervento di ieri da Verdi come fatturato"); // è già fatturato nel dataset
-  assert(noop && !noop.action && /già così|nulla da cambiare/i.test(noop.reply), 'No-op non riconosciuto: ' + (noop && noop.reply).slice(0,120));
-
-  // v8.12: small talk gestito offline (niente OpenAI per un "ciao")
-  const hi = ask('Ciao');
-  assert(hi && /Ciao Medardo/.test(hi.reply) && hi.quickReplies && hi.quickReplies.length >= 3, 'Small talk non gestito');
-  const hiData = ask('ciao, quanti ricavi oggi?');
-  assert(hiData && /350,00/.test(hiData.reply), 'Saluto+richiesta deve rispondere coi dati, non col saluto');
-
-  // v8.12: sinonimi economici e date estese
-  const guad = ask('Quanto ho guadagnato oggi?');
-  assert(guad && /350,00/.test(guad.reply), 'Sinonimo "guadagnato" non riconosciuto');
-  const dopo = ask('Ho fatto una visita clinica da Rossi dopodomani alle 9');
-  assert(dopo && dopo.action && dopo.action.type === 'create_intervention' && /09:00/.test(dopo.reply), '"dopodomani" non riconosciuto');
-
-  // v8.12: le domande cliniche NON devono diventare bozze di intervento
-  const clin = ask('Come si cura la mastite in una frisona?');
-  assert(clin === null || (clin.action == null && !/prestazione vuoi inserire/i.test(clin.reply || '')), 'Domanda clinica dirottata sul wizard intervento');
-  const clin2 = ask('Che terapia consigli per una metrite?');
-  assert(clin2 === null || (clin2.action == null), 'Domanda clinica 2 dirottata sul wizard');
-  // ...ma gli inserimenti espliciti restano wizard
-  const reg = ask('Ho fatto un cesareo da Rossi oggi alle 9');
-  assert(reg && reg.action && reg.action.type === 'create_intervention', 'Inserimento esplicito non più riconosciuto');
-
-  // Eliminazione: mai azione applicabile senza conferma esplicita
-  const del = ask('Elimina l\'intervento di Rossi di oggi');
-  assert(del && (!del.ui || del.ui.safeToApply !== true || /ELIMINA/i.test(del.reply)), 'Eliminazione senza percorso di conferma');
-
-  console.log('OK: test funzionali router v8.9 superati (KPI, KM, P.IVA, wizard, sicurezza).');
-
-  // --- v8.9: endpoint /api/db/* (chiamati davvero, senza rete) ---
-  if (mod.app && mod.app._routes) {
-    function call(method, url, body) {
-      return new Promise(resolve => {
-        const h = mod.app._routes[method].get(url);
-        assert(h, 'Endpoint mancante: ' + method + ' ' + url);
-        const res = { statusCode: 200, status(c){ this.statusCode = c; return this; }, json(payload){ resolve({ status: this.statusCode, body: payload }); } };
-        Promise.resolve(h({ body: body || {}, url }, res)).catch(e => resolve({ status: 500, body: { error: e.message } }));
-      });
-    }
-    const ping = await call('GET', '/api/db/ping');
-    assert(ping.body && ping.body.ok === true && ping.body.configured === false, '/api/db/ping deve dichiarare configured:false senza env');
-    const loadNoCfg = await call('GET', '/api/db/load');
-    assert(loadNoCfg.status === 503, '/api/db/load senza env deve rispondere 503, non fingere dati');
-    const saveNoCfg = await call('POST', '/api/db/save', { db: { aziende: [], int: [], prest: [] } });
-    assert(saveNoCfg.status === 503, '/api/db/save senza env deve rifiutare');
-    console.log('OK: test endpoint /api/db/* v8.9 superati.');
-
-    // v8.12: domanda libera senza OPENAI_API_KEY → risposta utile con quick replies, MAI un errore criptico
-    if (!process.env.OPENAI_API_KEY) {
-      const chat = await call('POST', '/api/vet-ai-chat', { input: 'Come si cura la mastite in una frisona?', context: { user:{id:'m',name:'Medardo'}, aziende: [], prestazioni: [], interventi: [], fatture: [] } });
-      assert(chat.body && /gestionale/i.test(chat.body.reply) && Array.isArray(chat.body.quickReplies) && chat.body.quickReplies.length >= 3, 'Senza chiave OpenAI la risposta deve restare utile: ' + (chat.body && chat.body.reply));
-      assert(chat.body.source === 'openai-missing-key', 'Source atteso openai-missing-key, ricevuto: ' + chat.body.source);
-      console.log('OK: test degradazione senza OpenAI v8.12 superato.');
-    }
-  }
+process.env.NODE_ENV = 'test';
+const NOW = new Date('2026-07-15T10:00:00');
+let passed = 0, failed = 0;
+function t(name, fn) {
+  try { fn(); passed++; console.log('  \u2713', name); }
+  catch (e) { failed++; console.error('  \u2717', name, '\n    ', e.message); }
 }
 
+/* ------------------------------------------------------------------ */
+/* Dataset realistico                                                  */
+/* ------------------------------------------------------------------ */
+const USERS = [
+  { id: 'medardo', name: 'Medardo Cammi', role: 'worker' },
+  { id: 'edoardo', name: 'Edoardo Ronda', role: 'worker' },
+  { id: 'ruralvet', name: 'Rural Vet', role: 'company' }
+];
+const AZIENDE = [
+  { id: 1, nome: 'Allevamento Rossi', addr: 'Via Po 7', km: 12, prezzi: { 4: 28 } },
+  { id: 2, nome: 'Cascina Belloni', addr: 'Strada Campagna 55', km: 9, prezzi: {} },
+  { id: 3, nome: 'Az. Agr. Fratelli Conti', addr: 'Via Cascina 12', km: 18, prezzi: {} },
+  { id: 4, nome: 'Societa Agricola Rossi e Figli', addr: 'Via Emilia 3', km: 25, prezzi: {} }
+];
+const PREST = [
+  { id: 1, nome: 'Visita clinica', cat: 'Visite', price: 35, _v: 2 },
+  { id: 2, nome: 'Cesareo', cat: 'Chirurgia', price: 300, _v: 1 },
+  { id: 4, nome: 'Fecondazione', cat: 'Riproduzione', price: 25 },
+  { id: 5, nome: 'Ecografia gravidanza', cat: 'Riproduzione', price: 25 },
+  { id: 7, nome: 'Trattamento mastite', cat: 'Terapia', price: 30 },
+  { id: 8, nome: 'Controllo podale', cat: 'Chirurgia', price: 45 },
+  { id: 9, nome: 'Vaccino vecchio', cat: 'Profilassi', price: 8, archived: true }
+];
+const INT = [
+  { id: 101, data: '2026-07-15', ora: '08:30', sess: 'm', userId: 'medardo', allId: 1, servs: [{ id: 2, qty: 1, price: 300 }, { id: 4, qty: 2, price: 25 }], tot: 350, fatt: false },
+  { id: 102, data: '2026-07-15', ora: '11:00', sess: 'm', userId: 'medardo', allId: 2, servs: [{ id: 1, qty: 1, price: 35 }], tot: 35, fatt: false },
+  { id: 103, data: '2026-07-14', ora: '09:00', sess: 'm', userId: 'medardo', allId: 3, servs: [{ id: 5, qty: 2, price: 25 }], tot: 50, fatt: true },
+  { id: 104, data: '2026-07-14', ora: '15:00', sess: 'p', userId: 'edoardo', allId: 1, servs: [{ id: 7, qty: 1, price: 30 }], tot: 30, fatt: false },
+  { id: 105, data: '2026-07-08', ora: '08:00', sess: 'm', userId: 'medardo', allId: 3, servs: [{ id: 1, qty: 1, price: 35 }], tot: 35, fatt: true },
+  { id: 106, data: '2026-06-10', ora: '10:00', sess: 'm', userId: 'medardo', allId: 2, servs: [{ id: 8, qty: 1, price: 45 }], tot: 45, fatt: true }
+];
+// Tratte materializzate + record sporchi che DEVONO essere esclusi.
+const KMROUTES = [
+  { id: 'r1', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', from: 'Casa', to: 'Allevamento Rossi', aziendaId: 1, azienda: 'Allevamento Rossi', km: 12.4, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [101] },
+  { id: 'r2', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', from: 'Allevamento Rossi', to: 'Cascina Belloni', aziendaId: 2, azienda: 'Cascina Belloni', km: 7.2, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [102] },
+  { id: 'r3', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', from: 'Cascina Belloni', to: 'Casa', aziendaId: '', azienda: '', km: 9.1, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [] },
+  { id: 'r4', data: '2026-07-14', userId: 'medardo', userName: 'Medardo Cammi', from: 'Casa', to: 'Az. Agr. Fratelli Conti', aziendaId: 3, azienda: 'Az. Agr. Fratelli Conti', km: 18.3, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [103] },
+  { id: 'r5', data: '2026-07-14', userId: 'medardo', userName: 'Medardo Cammi', from: 'Az. Agr. Fratelli Conti', to: 'Casa', km: 18.3, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [] },
+  { id: 'r6', data: '2026-07-14', userId: 'edoardo', userName: 'Edoardo Ronda', from: 'Casa', to: 'Allevamento Rossi', aziendaId: 1, azienda: 'Allevamento Rossi', km: 12, method: 'company_distance', isEstimate: true, sess: 'p', interventionIds: [104] },
+  { id: 'r7', data: '2026-07-08', userId: 'medardo', userName: 'Medardo Cammi', from: 'Casa', to: 'Az. Agr. Fratelli Conti', aziendaId: 3, azienda: 'Az. Agr. Fratelli Conti', km: 56, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [105] },
+  { id: 'r8', data: '2026-07-08', userId: 'medardo', userName: 'Medardo Cammi', from: 'Az. Agr. Fratelli Conti', to: 'Casa', km: 56, method: 'ors', isEstimate: false, sess: 'm', interventionIds: [] },
+  { id: 'bad1', data: '', userId: 'medardo', km: 30, method: 'ors' },
+  { id: 'bad2', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', km: -5, method: 'ors' },
+  { id: 'bad3', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', km: 999, method: 'ors' }
+];
+const FATTURE = [{ id: 900, numero: '12', data: '2026-07-14', allId: 3, tot: 61, pagata: false, interventi: [103] }];
 
-// --- v8.9: test funzionale del merge multi-dispositivo (esegue davvero il codice della patch) ---
-function syncMergeTests() {
-  const m = html.match(/<script id="rv-cloud-proxy-patch-v89">([\s\S]*?)<\/script>/);
-  assert(m, 'Patch rv-cloud-proxy-patch-v89 non trovata nell\'HTML');
-  const store = new Map();
-  const dbObj = { aziende: [], prest: [], int: [], fatture: [], meta: {} }; // stesso oggetto, mutato in place (come il global db nel browser)
-  const sandbox = {
-    document: { getElementById: () => null },
-    localStorage: { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v) },
-    fetch: async () => { throw new Error('no network in test'); },
-    alert: () => {},
-    SYNC: { binId: '', apiKey: '' },
-    RV_SAVE: { saving: false, dirty: false, lastKey: 'test_last_good', lastError: null },
-    rvEnsureMeta: function(){ dbObj.meta = dbObj.meta || {}; return dbObj.meta; },
-    rvNow: () => Date.now(),
-    rvClone: o => JSON.parse(JSON.stringify(o)),
-    migrate: () => {},
-    setSaveState: () => {},
-    mergeCloudRecord: () => {},
-    saveLocalCopy: function(reason){ store.set('test_last_good', JSON.stringify({ reason, savedAt: Date.now(), db: JSON.parse(JSON.stringify(dbObj)) })); },
-    loadLocalCopy: function(){ const raw = store.get('test_last_good'); if (!raw) return null; const p = JSON.parse(raw); return p && p.db ? p : null; }
-  };
-  sandbox.window = sandbox;
-  const params = ['window','document','localStorage','fetch','alert','SYNC','RV_SAVE','db','rvEnsureMeta','rvNow','rvClone','migrate','setSaveState','mergeCloudRecord','saveLocalCopy','loadLocalCopy'];
-  const fn = new Function(...params, m[1] + '\nreturn window.__rvSyncTest;');
-  const api = fn(sandbox, sandbox.document, sandbox.localStorage, sandbox.fetch, sandbox.alert, sandbox.SYNC, sandbox.RV_SAVE, dbObj, sandbox.rvEnsureMeta, sandbox.rvNow, sandbox.rvClone, sandbox.migrate, sandbox.setSaveState, sandbox.mergeCloudRecord, sandbox.saveLocalCopy, sandbox.loadLocalCopy);
-  assert(api && typeof api.mergeArr === 'function' && typeof api.stampChanged === 'function', 'Hook __rvSyncTest non esposto');
-
-  // Caso 1: locale NON modificato, remoto più recente → deve vincere il remoto (prima veniva sovrascritto in silenzio)
-  let merged = api.mergeArr([{ id: 1, nome: 'Rossi', note: 'vecchio', updatedAt: 1000 }], [{ id: 1, nome: 'Rossi', note: 'modificato da tablet', updatedAt: 2000 }], {});
-  assert(merged.length === 1 && merged[0].note === 'modificato da tablet', 'Merge: il remoto più recente deve vincere');
-
-  // Caso 2: locale più recente → vince il locale
-  merged = api.mergeArr([{ id: 1, v: 'loc', updatedAt: 3000 }], [{ id: 1, v: 'rem', updatedAt: 2000 }], {});
-  assert(merged[0].v === 'loc', 'Merge: il locale più recente deve vincere');
-
-  // Caso 3: nessun timestamp → comportamento storico (vince il locale)
-  merged = api.mergeArr([{ id: 1, v: 'loc' }], [{ id: 1, v: 'rem' }], {});
-  assert(merged[0].v === 'loc', 'Merge: senza timestamp deve vincere il locale (compatibilità)');
-
-  // Caso 4: tombstone → il record eliminato non deve tornare dal remoto
-  merged = api.mergeArr([], [{ id: 9, v: 'zombie' }], { 9: Date.now() });
-  assert(merged.length === 0, 'Merge: le eliminazioni (tombstone) devono essere rispettate');
-
-  // Caso 5: stampChanged marca solo i record davvero modificati rispetto allo snapshot sincronizzato
-  dbObj.aziende.push({ id: 1, nome: 'Rossi' }, { id: 2, nome: 'Verdi' });
-  sandbox.saveLocalCopy('cloud-saved'); // baseline
-  dbObj.aziende[0].nome = 'Rossi SRL';  // modifica reale solo sul primo
-  api.stampChanged();
-  assert(dbObj.aziende[0].updatedAt > 0, 'stampChanged: record modificato senza updatedAt');
-  assert(!dbObj.aziende[1].updatedAt, 'stampChanged: record NON modificato marcato per errore');
-
-  // Caso 6: record nuovo (assente nello snapshot) riceve il timestamp
-  dbObj.int.push({ id: 100, data: '2026-07-14', tot: 350 });
-  api.stampChanged();
-  assert(dbObj.int[0].updatedAt > 0, 'stampChanged: nuovo record senza updatedAt');
-
-  console.log('OK: test funzionali merge multi-dispositivo v8.9 superati.');
+function makeBody({ user = USERS[0], km = KMROUTES, extras = {} } = {}) {
+  return { context: { user, users: USERS, aziende: AZIENDE, prestazioni: PREST, interventi: INT, fatture: FATTURE, km, ...extras } };
 }
-syncMergeTests();
-
-// --- v8.10: test funzionale annulla-eliminazione (esegue davvero il codice della patch UX) ---
-function uxUndoTests() {
-  const m = html.match(/<script id="rv-v810-ux-script">([\s\S]*?)<\/script>/);
-  assert(m, 'Patch rv-v810-ux-script non trovata');
-  const dbObj = { int: [{ id: 100, data: '2026-07-14', tot: 350 }], deleted: { int: {}, fatture: {}, aziende: {}, prest: {} }, meta: {} };
-  const timers = [];
-  const els = {};
-  function fakeEl(){ return { id:'', className:'', style:{}, children:[], textContent:'', type:'', onclick:null,
-    appendChild(c){ this.children.push(c); return c; }, removeChild(c){ this.children = this.children.filter(x=>x!==c); },
-    setAttribute(){}, getAttribute(){ return null; }, classList:{ contains:()=>false }, closest(){ return null; } }; }
-  const sandbox = {
-    document: {
-      getElementById: id => els[id] || null,
-      createElement: () => fakeEl(),
-      body: Object.assign(fakeEl(), { appendChild(c){ if (c.id) els[c.id] = c; this.children.push(c); return c; }, style:{} }),
-      addEventListener: () => {}
-    },
-    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
-    confirm: () => true,
-    alert: () => {},
-    console,
-    JSON,
-    Date,
-    db: dbObj,
-    tab: 'storico',
-    rStorico: () => {},
-    go: () => {},
-    saveCloud: () => { sandbox.saves++; },
-    saves: 0,
-    rvEnsureMeta: function(){ dbObj.deleted = dbObj.deleted || { int:{} }; dbObj.meta = dbObj.meta || {}; return dbObj.meta; },
-    canManageIntervento: () => true,
-    setSaveState: () => {},
-    openModal: () => {},
-    closeModal: () => {},
-    deleteIntervento: function(id){ /* versione base che la patch deve avvolgere */ dbObj.int = dbObj.int.filter(x => x.id !== id); }
-  };
-  sandbox.window = sandbox;
-  const params = ['window','document','setTimeout','confirm','alert','console','db','tab','rStorico','go','saveCloud','rvEnsureMeta','canManageIntervento','setSaveState','openModal','closeModal'];
-  const fn = new Function(...params, m[1] + '\nreturn window.__rvUxTest;');
-  const api = fn(sandbox, sandbox.document, sandbox.setTimeout, sandbox.confirm, sandbox.alert, console, dbObj, sandbox.tab, sandbox.rStorico, sandbox.go, sandbox.saveCloud, sandbox.rvEnsureMeta, sandbox.canManageIntervento, sandbox.setSaveState, sandbox.openModal, sandbox.closeModal);
-  assert(api && typeof api.deleteIntervento === 'function' && typeof api.toast === 'function', 'Hook __rvUxTest non esposto');
-
-  // Eliminazione: record rimosso + tombstone scritto + salvataggio cloud
-  api.deleteIntervento(100);
-  assert(dbObj.int.length === 0, 'Undo test: intervento non eliminato');
-  assert(dbObj.deleted.int['100'] > 0, 'Undo test: tombstone non scritto');
-  assert(sandbox.saves >= 1, 'Undo test: saveCloud non chiamato dopo eliminazione');
-
-  // Il toast deve offrire "Annulla": lo clicco e l'intervento torna, senza tombstone
-  const host = els['rvToastHost'];
-  assert(host && host.children.length === 1, 'Undo test: toast non mostrato');
-  const toastEl = host.children[0];
-  const btn = toastEl.children.find(c => typeof c.onclick === 'function');
-  assert(btn && btn.textContent === 'Annulla', 'Undo test: bottone Annulla mancante');
-  btn.onclick();
-  assert(dbObj.int.length === 1 && String(dbObj.int[0].id) === '100', 'Undo test: intervento non ripristinato');
-  assert(!dbObj.deleted.int['100'], 'Undo test: tombstone non rimosso dopo il ripristino');
-  assert(dbObj.int[0].updatedAt > 0, 'Undo test: il ripristino deve marcare updatedAt per vincere nel merge');
-
-  console.log('OK: test funzionali annulla-eliminazione v8.10 superati.');
+function ctxFor(userId = 'medardo', opts = {}) {
+  const user = USERS.find(u => u.id === userId);
+  const auth = { uid: user.id, name: user.name, role: user.role, ai: userId !== 'edoardo', exp: Date.now() + 60000 };
+  const ctx = buildContext(makeBody({ user, ...opts }), auth);
+  ctx.now = NOW;
+  return ctx;
 }
-uxUndoTests();
 
-// --- v8.11: test funzionale del formatter dell'interfaccia AI (esegue davvero il codice della patch) ---
-function aiProUiTests() {
-  const m = html.match(/<script id="rv-v811-ai-pro-script">([\s\S]*?)<\/script>/);
-  assert(m, 'Patch rv-v811-ai-pro-script non trovata');
-  const sandbox = {
-    document: { getElementById: () => null, querySelector: () => null, createElement: () => ({ setAttribute(){}, appendChild(){}, addEventListener(){}, classList:{toggle(){}}, querySelectorAll: () => [] }), addEventListener: () => {}, body: null },
-    localStorage: { getItem: () => null },
-    fetch: async () => { throw new Error('no net'); },
-    navigator: {},
-    MutationObserver: undefined,
-    console
-  };
-  sandbox.window = sandbox;
-  const fn = new Function('window','document','localStorage','fetch','navigator','MutationObserver','console', m[1] + '\nreturn window.__rvAiProTest;');
-  const api = fn(sandbox, sandbox.document, sandbox.localStorage, sandbox.fetch, sandbox.navigator, undefined, console);
-  assert(api && typeof api.formatMessage === 'function', 'Hook __rvAiProTest non esposto');
+/* ------------------------------------------------------------------ */
+console.log('\n== dateRangeParser ==');
+t('oggi', () => assert.deepEqual(parsePeriod('km oggi', NOW).from, '2026-07-15'));
+t('ieri', () => assert.equal(parsePeriod('ieri', NOW).from, '2026-07-14'));
+t('altroieri', () => assert.equal(parsePeriod('quanti km altroieri', NOW).from, '2026-07-13'));
+t('data italiana', () => assert.equal(parsePeriod('km del 15/07/2026', NOW).from, '2026-07-15'));
+t('data ISO', () => assert.equal(parsePeriod('km del 2026-07-08', NOW).from, '2026-07-08'));
+t('nome mese', () => { const p = parsePeriod('km di giugno 2026', NOW); assert.equal(p.from, '2026-06-01'); assert.equal(p.to, '2026-06-30'); });
+t('dal X al Y', () => { const p = parsePeriod('km dal 01/07 al 15/07', NOW); assert.equal(p.from, '2026-07-01'); assert.equal(p.to, '2026-07-15'); });
+t('tra il 3 e il 15 luglio (mese condiviso)', () => { const p = parsePeriod('tra il 3 e il 15 luglio', NOW); assert.equal(p.from, '2026-07-03'); assert.equal(p.to, '2026-07-15'); });
+t('dal 3 maggio 2026 al 20 maggio 2026', () => { const p = parsePeriod('dal 3 maggio 2026 al 20 maggio 2026', NOW); assert.equal(p.from, '2026-05-03'); assert.equal(p.to, '2026-05-20'); });
+t('lunedì scorso', () => assert.equal(parsePeriod('lunedi scorso', NOW).from, '2026-07-13'));
+t('questa settimana', () => assert.equal(parsePeriod('questa settimana', NOW).from, '2026-07-13'));
+t('settimana scorsa', () => { const p = parsePeriod('settimana scorsa', NOW); assert.equal(p.from, '2026-07-06'); assert.equal(p.to, '2026-07-12'); });
+t('da inizio anno', () => assert.equal(parsePeriod('da inizio anno', NOW).from, '2026-01-01'));
+t('ultimi 7 giorni', () => assert.equal(parsePeriod('ultimi 7 giorni', NOW).from, '2026-07-09'));
 
-  // Riepilogo tipico del backend → titolo, elenco puntato, importi evidenziati, hint separato
-  const h1 = api.formatMessage('Riepilogo economico Medardo · oggi:\n- Ricavi interventi: 350,00 € (1 interventi).\n- Da fatturare: 350,00 €.\nVuoi il grafico?');
-  assert(/rvRichTitle/.test(h1), 'Formatter: titolo mancante');
-  assert(/rvRichScope/.test(h1), 'Formatter: scope (· oggi) non separato nel titolo');
-  assert((h1.match(/<li>/g) || []).length === 2, 'Formatter: elenco puntato non costruito');
-  assert(/rvNum/.test(h1) && /350,00\s?€/.test(h1), 'Formatter: importo non evidenziato');
-  assert(/rvRichHint/.test(h1), 'Formatter: domanda finale non resa come hint');
+console.log('\n== Motore KM ==');
+t('KM oggi Medardo: totale esatto con decimali', () => {
+  const st = kmStats(ctxFor('medardo'), { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.totalKm, 28.7);
+  assert.equal(st.routeCount, 3);
+  assert.equal(st.source, 'registered_routes');
+  assert.equal(st.isEstimate, false);
+});
+t('record sporchi esclusi e riportati (senza data, negativi, anomali)', () => {
+  const st = kmStats(ctxFor('medardo'), { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  const reasons = st.excluded.map(e => e.reason).join('|');
+  assert.ok(/senza data/.test(reasons) && /negativ/.test(reasons) && /anomal/.test(reasons));
+});
+t('nessun doppio conteggio: le tratte vincono sugli interventi', () => {
+  const withIntKm = INT.map(i => ({ ...i, km: 500 }));
+  const ctx = ctxFor('medardo', { extras: { interventi: withIntKm } });
+  const st = kmStats(ctx, { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.totalKm, 28.7);
+  assert.equal(st.source, 'registered_routes');
+});
+t('fallback: KM salvati negli interventi quando mancano tratte', () => {
+  const withIntKm = INT.map(i => ({ ...i, km: i.id === 101 ? 20 : (i.id === 102 ? 10 : 0) }));
+  const ctx = ctxFor('medardo', { km: [], extras: { interventi: withIntKm } });
+  const st = kmStats(ctx, { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.source, 'intervention_km');
+  assert.equal(st.totalKm, 30);
+});
+t('fallback stima da distanza azienda con A/R, dichiarata come stima', () => {
+  const ctx = ctxFor('medardo', { km: [] });
+  const st = kmStats(ctx, { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.source, 'company_distance_estimate');
+  assert.equal(st.isEstimate, true);
+  assert.equal(st.totalKm, 24);
+});
+t('due interventi nella stessa azienda nello stesso giro = una sola tratta', () => {
+  const doubled = [...INT, { id: 199, data: '2026-07-15', ora: '09:15', sess: 'm', userId: 'medardo', allId: 1, servs: [{ id: 1, qty: 1, price: 35 }], tot: 35, fatt: false }];
+  const ctx = ctxFor('medardo', { km: [], extras: { interventi: doubled } });
+  const st = kmStats(ctx, { period: { from: '2026-07-15', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.totalKm, 24);
+});
+t('intervallo 1–15 luglio: totale, giorni attivi, media/intervento', () => {
+  const st = kmStats(ctxFor('medardo'), { period: { from: '2026-07-01', to: '2026-07-15' }, user: USERS[0] });
+  assert.equal(st.totalKm, 177.3);
+  assert.equal(st.activeDays, 3);
+  assert.equal(st.interventionCount, 4);
+  assert.equal(st.averageKmPerIntervention, 44.33);
+  assert.equal(st.topDays[0].label, '2026-07-08');
+});
+t('intervallo senza dati: risposta onesta con cosa manca', () => {
+  const r = kmAnalyticsQuery('quanti km ho fatto a marzo 2026', ctxFor('medardo'));
+  assert.ok(/Nessun dato KM affidabile/.test(r.reply));
+  assert.equal(r.data.totalKm, 0);
+});
+t('kmAnalyticsQuery: giorno singolo con fonte e periodo visibili', () => {
+  const r = kmAnalyticsQuery('quanti km ho percorso oggi?', ctxFor('medardo'));
+  assert.ok(/28,7 km/.test(r.reply));
+  assert.ok(/Fonte: tratte registrate/.test(r.reply));
+  assert.ok(/oggi/.test(r.reply));
+  assert.equal(r.data.source, 'registered_routes');
+  assert.equal(r.ui.mode, 'km_analytics');
+});
+t('confronto con periodo precedente', () => {
+  const r = kmAnalyticsQuery('confronta i km di questa settimana con quella precedente', ctxFor('medardo'));
+  assert.ok(r.data.compare, 'manca il blocco confronto');
+  assert.ok(/Confronto/.test(r.reply));
+});
+t('scope Medardo: "i miei km" filtrati su di lui automaticamente', () => {
+  const r = kmAnalyticsQuery('i miei km di ieri', ctxFor('medardo'));
+  assert.equal(r.data.totalKm, 36.6);
+  assert.ok(/Medardo Cammi/.test(r.reply));
+});
+t('scope Medardo: chiedere i km di Edoardo torna comunque i propri', () => {
+  const r = kmAnalyticsQuery('km di Edoardo di ieri', ctxFor('medardo'));
+  assert.equal(r.data.totalKm, 36.6);
+  assert.ok(/solo i propri KM/.test(r.reply));
+});
+t('scope Rural Vet: km di Edoardo (stima dichiarata)', () => {
+  const r = kmAnalyticsQuery('km di Edoardo di ieri', ctxFor('ruralvet'));
+  assert.equal(r.data.totalKm, 12);
+  assert.ok(/stima/.test(r.reply.toLowerCase()));
+});
+t('scope Rural Vet: km societari del periodo (tutti gli utenti)', () => {
+  const r = kmAnalyticsQuery('km dal 14 al 15 luglio', ctxFor('ruralvet'));
+  assert.equal(r.data.totalKm, 77.3);
+});
+t('router: "mostrami tutte le tratte di ieri" passa dal motore KM', () => {
+  const r = deterministicRouter('mostrami tutte le tratte di ieri', ctxFor('medardo'));
+  assert.equal(r.ui.mode, 'km_analytics');
+  assert.ok(/Tratte:/.test(r.reply));
+});
 
-  // Classifica numerata → <ol> con 2 voci; percentuali evidenziate
-  const h2 = api.formatMessage('Ricavi per cliente · questo mese:\n1) Rossi: 350,00 € · 87,5%\n2) Verdi: 50,00 € · 12,5%');
-  assert(/<ol>/.test(h2) && (h2.match(/<li>/g) || []).length === 2, 'Formatter: classifica non numerata');
-  assert(/87,5\s?%/.test(h2), 'Formatter: percentuale persa');
+console.log('\n== Catalogo prestazioni ==');
+t('creazione completa in un colpo: riepilogo e SALVA', () => {
+  const r = serviceCatalogRouter('crea la prestazione visita ginecologica categoria Riproduzione prezzo 45', ctxFor('medardo'));
+  assert.equal(r.action.type, 'create_service');
+  assert.equal(r.action.price, 45);
+  assert.ok(/SALVA/.test(r.reply));
+});
+t('creazione con prezzo mancante: lo chiede (bozza firmata)', () => {
+  const r = serviceCatalogRouter('aggiungi la prestazione visita ginecologica al listino', ctxFor('medardo'));
+  assert.equal(r.action.type, 'continue_service_draft');
+  assert.ok(/prezzo/i.test(r.reply));
+  const draft = readSignedDraft(r.action.draft);
+  assert.equal(draft.kind, 'service_create');
+});
+t('continuazione bozza: risposta col prezzo completa il flusso', () => {
+  const ctx = ctxFor('medardo');
+  const r1 = serviceCatalogRouter('aggiungi la prestazione visita ginecologica categoria Riproduzione', ctx);
+  const r2 = continueServiceDraft('45', r1.action.draft, ctx);
+  assert.equal(r2.action.type, 'create_service');
+  assert.equal(r2.action.price, 45);
+});
+t('bozza manomessa: rifiutata', () => {
+  const ctx = ctxFor('medardo');
+  const r1 = serviceCatalogRouter('aggiungi la prestazione visita ginecologica', ctx);
+  const evil = { payload: r1.action.draft.payload, sig: 'a'.repeat(64) };
+  const r2 = continueServiceDraft('45', evil, ctx);
+  assert.ok(/non \u00e8 pi\u00f9 valida/.test(r2.reply));
+});
+t('duplicato esatto: non crea e lo dice', () => {
+  const r = serviceCatalogRouter('crea la prestazione controllo podale a 45 euro', ctxFor('medardo'));
+  assert.ok(/Esiste gi\u00e0/.test(r.reply));
+  assert.ok(!r.action || r.action.type !== 'create_service');
+});
+t('modifica prezzo: PRIMA/DOPO + impatto e nessun ritocco storico', () => {
+  const r = serviceCatalogRouter('porta il cesareo a 320 euro', ctxFor('medardo'));
+  assert.equal(r.action.type, 'update_service');
+  assert.deepEqual(r.action.before, { price: 300 });
+  assert.deepEqual(r.action.after, { price: 320 });
+  assert.equal(r.action.recordVersion, 1);
+  assert.ok(/gi\u00e0 salvati restano invariati/.test(r.reply));
+});
+t('rinomina', () => {
+  const r = serviceCatalogRouter('rinomina visita clinica in visita clinica bovina', ctxFor('medardo'));
+  assert.equal(r.action.fields.name, 'Visita clinica bovina');
+  assert.equal(r.action.before.name, 'Visita clinica');
+});
+t('cambio categoria', () => {
+  const r = serviceCatalogRouter('sposta ecografia nella categoria Diagnostica', ctxFor('medardo'));
+  assert.equal(r.action.fields.cat, 'Diagnostica');
+});
+t('modifica multipla: prezzo e categoria in una frase', () => {
+  const r = serviceCatalogRouter('modifica controllo podale: prezzo 50 euro e categoria Ortopedia', ctxFor('medardo'));
+  assert.equal(r.action.fields.price, 50);
+  assert.equal(r.action.fields.cat, 'Ortopedia');
+});
+t('no-op: prezzo già impostato così', () => {
+  const r = serviceCatalogRouter('porta il cesareo a 300 euro', ctxFor('medardo'));
+  assert.ok(/gi\u00e0 impostato cos\u00ec/i.test(r.reply));
+  assert.equal(r.action, null);
+});
+t('prezzo personalizzato per azienda: PRIMA (listino) → DOPO (personalizzato)', () => {
+  const r = serviceCatalogRouter('imposta il prezzo del cesareo per Belloni a 280 euro', ctxFor('medardo'));
+  assert.equal(r.action.type, 'update_service');
+  assert.equal(String(r.action.companyId), '2');
+  assert.equal(r.action.before.price, 300);
+  assert.equal(r.action.after.price, 280);
+});
+t('prezzo personalizzato no-op (Rossi ha già fecondazione a 28)', () => {
+  const r = serviceCatalogRouter('imposta il prezzo della fecondazione per Allevamento Rossi a 28 euro', ctxFor('medardo'));
+  assert.ok(/gi\u00e0 impostato cos\u00ec/i.test(r.reply));
+});
+t('rimozione prezzo personalizzato', () => {
+  const r = serviceCatalogRouter('togli il prezzo personalizzato di Allevamento Rossi per la fecondazione', ctxFor('medardo'));
+  assert.equal(r.action.type, 'remove_company_price');
+  assert.equal(r.action.before.price, 28);
+  assert.equal(r.action.after.price, 25);
+});
+t('eliminazione prestazione usata → archiviazione con motivazione', () => {
+  const r = serviceCatalogRouter('elimina il cesareo dal listino', ctxFor('medardo'));
+  assert.equal(r.action.type, 'archive_service');
+  assert.ok(/storico/.test(r.reply));
+});
+t('eliminazione prestazione mai usata → delete con ELIMINA e cestino', () => {
+  const ctx = ctxFor('medardo', { extras: { prestazioni: [...PREST, { id: 99, nome: 'Voce inutilizzata', cat: 'Test', price: 10 }] } });
+  const r = serviceCatalogRouter('elimina la prestazione voce inutilizzata', ctx);
+  assert.equal(r.action.type, 'delete_service');
+  assert.ok(/ELIMINA/.test(r.reply));
+});
+t('ripristino prestazione archiviata', () => {
+  const r = serviceCatalogRouter('ripristina la prestazione vaccino vecchio', ctxFor('medardo'));
+  assert.equal(r.action.type, 'restore_service');
+});
+t('versione record nel contratto (concorrenza)', () => {
+  const r = serviceCatalogRouter('porta la visita clinica a 40 euro', ctxFor('medardo'));
+  assert.equal(r.action.recordVersion, 2);
+});
 
-  // SALVA/ELIMINA come tasti; XSS bloccato
-  const h3 = api.formatMessage('Scrivi SALVA per applicarla oppure ELIMINA.\n<img src=x onerror=alert(1)>');
-  assert(/<kbd>SALVA<\/kbd>/.test(h3) && /rvKbdDanger/.test(h3), 'Formatter: comandi non evidenziati');
-  assert(!/<img/.test(h3) && /&lt;img/.test(h3), 'Formatter: HTML non sanificato (XSS)');
+console.log('\n== Prestazioni negli interventi (operazioni di riga) ==');
+const rows0 = [{ id: '2', nome: 'Cesareo', qty: 1, price: 300 }, { id: '4', nome: 'Fecondazione', qty: 2, price: 25 }];
+t('applyLineOps: aggiunta con somma su riga esistente', () => {
+  const r = applyLineOps(rows0, [{ op: 'add', serviceId: '4', qty: 2, price: 25 }]);
+  assert.equal(r.rows.find(x => x.id === '4').qty, 4);
+  assert.equal(r.total, 400);
+});
+t('applyLineOps: rimozione di una sola unità', () => {
+  const r = applyLineOps(rows0, [{ op: 'removeUnit', serviceId: '4', qty: 1 }]);
+  assert.equal(r.rows.find(x => x.id === '4').qty, 1);
+  assert.equal(r.total, 325);
+});
+t('applyLineOps: rimozione unità che azzera la riga', () => {
+  const r = applyLineOps(rows0, [{ op: 'removeUnit', serviceId: '2', qty: 1 }]);
+  assert.ok(!r.rows.find(x => x.id === '2'));
+  assert.equal(r.total, 50);
+});
+t('applyLineOps: sostituzione totale con fusione su riga esistente', () => {
+  const r = applyLineOps([{ id: '2', nome: 'Cesareo', qty: 1, price: 300 }, { id: '1', nome: 'Visita clinica', qty: 1, price: 35 }], [{ op: 'replace', serviceId: '2', toServiceId: '1', toServiceName: 'Visita clinica', toPrice: 35 }]);
+  assert.equal(r.rows.length, 1);
+  assert.equal(r.rows[0].qty, 2);
+  assert.equal(r.total, 70);
+});
+t('applyLineOps: sostituzione parziale (una delle due)', () => {
+  const r = applyLineOps(rows0, [{ op: 'replacePartial', serviceId: '4', qty: 1, toServiceId: '5', toServiceName: 'Ecografia gravidanza', toPrice: 25 }]);
+  assert.equal(r.rows.find(x => x.id === '4').qty, 1);
+  assert.equal(r.rows.find(x => x.id === '5').qty, 1);
+  assert.equal(r.total, 350);
+});
+t('applyLineOps: setQty e setPrice con totale corretto', () => {
+  const r = applyLineOps(rows0, [{ op: 'setQty', serviceId: '4', qty: 3 }, { op: 'setPrice', serviceId: '2', price: 280 }]);
+  assert.equal(r.total, 355);
+});
+t('applyLineOps: fusione di due righe uguali', () => {
+  const r = applyLineOps([{ id: '4', nome: 'Fecondazione', qty: 1, price: 25 }, { id: '4', nome: 'Fecondazione', qty: 2, price: 25 }], []);
+  assert.equal(r.rows.length, 1);
+  assert.equal(r.rows[0].qty, 3);
+});
+t('"aggiungi due fecondazioni all\'intervento di Rossi di oggi" → PRIMA/DOPO', () => {
+  const r = updateInterventionRequest("aggiungi due fecondazioni all'intervento di Rossi di oggi", ctxFor('medardo'));
+  assert.equal(r.action.type, 'update_intervention');
+  assert.equal(r.action.interventionId, 101);
+  assert.ok(/PRIMA/.test(r.reply) && /DOPO/.test(r.reply));
+  assert.equal(r.action.after.total, 400);
+});
+t('"porta le fecondazioni a 3" nell\'intervento giusto', () => {
+  const r = updateInterventionRequest('porta le fecondazioni da due a tre nell\'intervento di oggi', ctxFor('medardo'));
+  assert.equal(r.action.after.rows.find(x => x.id === '4').qty, 3);
+  assert.equal(r.action.after.total, 375);
+});
+t('"togli una fecondazione dall\'intervento di oggi"', () => {
+  const r = updateInterventionRequest("togli una fecondazione dall'intervento di Rossi di oggi", ctxFor('medardo'));
+  assert.equal(r.action.after.rows.find(x => x.id === '4').qty, 1);
+  assert.equal(r.action.after.total, 325);
+});
+t('"cambia il cesareo in visita clinica" con quantità preservata', () => {
+  const r = updateInterventionRequest('cambia il cesareo in visita clinica nell\'intervento di Rossi di oggi', ctxFor('medardo'));
+  const v = r.action.after.rows.find(x => x.id === '1');
+  assert.ok(v && v.qty === 1);
+  assert.equal(r.action.after.total, 85);
+});
+t('"correggi il prezzo del cesareo in questo intervento a 280"', () => {
+  const r = updateInterventionRequest('correggi il prezzo del cesareo in questo intervento a 280 di oggi', ctxFor('medardo'));
+  assert.equal(r.action.after.rows.find(x => x.id === '2').price, 280);
+  assert.equal(r.action.after.total, 330);
+});
+t('aggiunta usa il prezzo giusto per l\'azienda (Belloni: listino 25)', () => {
+  const r = updateInterventionRequest("aggiungi una fecondazione all'intervento di Belloni di oggi", ctxFor('medardo'));
+  const row = r.action.after.rows.find(x => x.id === '4');
+  assert.equal(row.price, 25);
+});
+t('più interventi possibili → scelta numerata o target univoco, mai modifica cieca', () => {
+  const r = updateInterventionRequest('togli il trattamento mastite dall\'intervento di ieri', ctxFor('ruralvet'));
+  assert.ok(r.action.interventionId === 104 || Array.isArray(r.action.options));
+});
+t('no-op sulle righe: "è già così"', () => {
+  const r = updateInterventionRequest('porta le fecondazioni a 2 nell\'intervento di Rossi di oggi', ctxFor('medardo'));
+  assert.ok(/gi\u00e0 cos\u00ec/i.test(r.reply));
+});
 
-  // Importi negativi in rosso
-  const h4 = api.formatMessage('Differenza: (120,00 €) rispetto a ieri');
-  assert(/rvNeg/.test(h4), 'Formatter: importo negativo non marcato');
+console.log('\n== Autorizzazioni e token ==');
+t('token valido verificato, manomesso rifiutato', () => {
+  const tok = rvMakeToken({ id: 'medardo', name: 'Medardo Cammi', role: 'worker', aiAccess: true });
+  assert.ok(rvVerifyToken(tok));
+  assert.equal(rvVerifyToken(tok.slice(0, -2) + 'zz'), null);
+});
+t('buildContext ignora l\'impersonificazione dal client', () => {
+  const auth = { uid: 'medardo', name: 'Medardo Cammi', role: 'worker', ai: true, exp: Date.now() + 60000 };
+  const ctx = buildContext(makeBody({ user: { id: 'ruralvet', name: 'Rural Vet', role: 'company' } }), auth);
+  assert.equal(ctx.currentUser.id, 'medardo');
+});
 
-  console.log('OK: test funzionali interfaccia AI pro v8.11 superati.');
+console.log('\n== HTTP end-to-end (endpoint reali) ==');
+const server = app.listen(0);
+const base = () => `http://127.0.0.1:${server.address().port}`;
+async function httpTests() {
+  const post = (path, body, token) => fetch(base() + path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: JSON.stringify(body) });
+
+  let r = await post('/api/auth/login', { userId: 'medardo', password: '1996' });
+  assert.equal(r.status, 200); const medardo = await r.json(); assert.ok(medardo.token && medardo.aiAccess);
+  passed++; console.log('  \u2713 login Medardo con token e aiAccess');
+
+  r = await post('/api/auth/login', { userId: 'medardo', password: 'sbagliata' });
+  assert.equal(r.status, 401); passed++; console.log('  \u2713 login con password errata rifiutato');
+
+  r = await post('/api/auth/login', { userId: 'edoardo', password: '0000' });
+  const edo = await r.json(); assert.equal(edo.aiAccess, false);
+  passed++; console.log('  \u2713 login Edoardo: nessun accesso AI dichiarato');
+
+  r = await post('/api/vet-ai-chat', { input: 'km oggi', ...makeBody() });
+  assert.equal(r.status, 401); passed++; console.log('  \u2713 chat senza token \u2192 401');
+
+  r = await post('/api/vet-ai-chat', { input: 'km oggi', ...makeBody({ user: USERS[1] }) }, edo.token);
+  assert.equal(r.status, 403); passed++; console.log('  \u2713 Edoardo \u2192 403 anche chiamando l\u2019endpoint direttamente');
+
+  r = await post('/api/vet-ai-chat', { input: 'quanti km ho percorso oggi?', ...makeBody() }, medardo.token);
+  assert.equal(r.status, 200); const j = await r.json();
+  assert.ok(/28,7/.test(j.reply)); assert.equal(j.ui.scope.userId, 'medardo'); assert.equal(j.data.source, 'registered_routes');
+  passed++; console.log('  \u2713 chat Medardo: 28,7 km, scope e fonte nel contratto');
+
+  r = await post('/api/vet-ai-chat', { input: 'km di edoardo di ieri', ...makeBody({ user: USERS[2] }) }, medardo.token);
+  const j2 = await r.json(); assert.ok(/solo i propri KM/.test(j2.reply));
+  passed++; console.log('  \u2713 il token vince sul context: niente impersonificazione');
+
+  r = await post('/api/auth/login', { userId: 'ruralvet', password: '2026' });
+  const rv = await r.json();
+  r = await post('/api/vet-ai-chat', { input: 'km di edoardo di ieri', ...makeBody({ user: USERS[2] }) }, rv.token);
+  const j3 = await r.json(); assert.equal(j3.data.totalKm, 12);
+  passed++; console.log('  \u2713 Rural Vet legge i km di Edoardo (stima dichiarata)');
+
+  r = await fetch(base() + '/api/db/load');
+  assert.equal(r.status, 401); passed++; console.log('  \u2713 /api/db/load senza token \u2192 401');
 }
-aiProUiTests();
 
-await functionalTests();
-console.log('OK: smoke test Rural Vet AI v8.9 (sync sicuro + fix router) superato.');
+httpTests().catch(e => { failed++; console.error('  \u2717 HTTP:', e.message); }).finally(() => {
+  server.close();
+  console.log(`\n${passed} test superati, ${failed} falliti.`);
+  process.exit(failed ? 1 : 0);
+});
