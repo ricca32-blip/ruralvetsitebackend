@@ -11,14 +11,17 @@ const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 9000);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 24000);
-const VERSION = '9.0.0-rethink';
+const VERSION = '9.1.0';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || 'missing-key' });
 
+// v9.1 · le stesse opzioni CORS valgono anche per il preflight OPTIONS
+// (prima il preflight rispondeva sempre "*", incoerente con ALLOWED_ORIGIN).
+const corsOptions = { origin: ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN.split(',').map(s => s.trim()) };
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: process.env.JSON_LIMIT || '12mb' }));
-app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? '*' : ALLOWED_ORIGIN.split(',').map(s => s.trim()) }));
-app.options('*', cors());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   next();
@@ -30,7 +33,19 @@ function safeText(value, max = 5000) {
 function asArray(value) { return Array.isArray(value) ? value : []; }
 function num(value, fallback = 0) {
   if (value === null || value === undefined || value === '') return fallback;
-  if (typeof value === 'string') value = value.replace(/\./g, '').replace(',', '.').replace(/[^0-9.-]/g, '');
+  if (typeof value === 'string') {
+    // v9.1 · fix: "12.4" veniva letto 124 (il punto era sempre trattato come
+    // separatore delle migliaia). Ora: se c'è la virgola, i punti sono migliaia
+    // ("1.234,56" → 1234.56); senza virgola un punto singolo con 1-2 decimali è
+    // decimale ("12.4" → 12.4), mentre "1.234" / "1.234.567" restano migliaia.
+    let s = value.trim().replace(/[^0-9.,-]/g, '');
+    if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+    else {
+      const parts = s.split('.');
+      if (parts.length > 2 || (parts.length === 2 && parts[1].length === 3 && parts[0].length <= 3 && parts[0] !== '0' && parts[0] !== '-0')) s = s.replace(/\./g, '');
+    }
+    value = s;
+  }
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -60,8 +75,11 @@ function dateFromISO(s) {
   if (!s) return null;
   const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (!m) return null;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return Number.isNaN(d.getTime()) ? null : d;
+  const y = Number(m[1]), mo = Number(m[2]), day = Number(m[3]);
+  const d = new Date(y, mo - 1, day);
+  // v9.1 · niente rollover silenzioso: "2026-30-12" prima diventava giugno 2028.
+  if (Number.isNaN(d.getTime()) || d.getFullYear() !== y || d.getMonth() !== mo - 1 || d.getDate() !== day) return null;
+  return d;
 }
 function addDays(date, days) { const d = new Date(date.getFullYear(), date.getMonth(), date.getDate()); d.setDate(d.getDate() + days); return d; }
 function startOfWeek(now) { const day = now.getDay() || 7; return addDays(now, 1 - day); }
@@ -101,13 +119,19 @@ const NUMBER_WORDS = new Map([
   ['un',1], ['uno',1], ['una',1], ['due',2], ['tre',3], ['quattro',4], ['cinque',5], ['sei',6], ['sette',7], ['otto',8], ['nove',9], ['dieci',10]
 ]);
 
+function validDayMonth(day, month) {
+  return Number(month) >= 1 && Number(month) <= 12 && Number(day) >= 1 && Number(day) <= 31;
+}
 function parseItalianDate(text, now = new Date()) {
   const raw = safeText(text, 4000);
   const n = norm(raw);
   let m = raw.match(/\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b/);
-  if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
-  m = raw.match(/\b(\d{1,2})[\/.-](\d{1,2})(?:[\/.-](20\d{2}|\d{2}))?\b/);
-  if (m) {
+  if (m && validDayMonth(m[3], m[2])) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
+  // v9.1 · "alle 12.30" / "ore 9.15" sono orari, non date: prima "12.30"
+  // diventava un finto 12/mese-30 con rollover di data. Ora gli orari
+  // introdotti da alle/ore vengono ignorati e giorno/mese sono validati.
+  m = raw.match(/(?:^|[^\d])(?<!alle\s)(?<!ore\s)(\d{1,2})[\/.-](\d{1,2})(?:[\/.-](20\d{2}|\d{2}))?\b/i);
+  if (m && validDayMonth(m[1], m[2])) {
     let y = m[3] ? Number(m[3]) : now.getFullYear();
     if (y < 100) y += 2000;
     return `${y}-${pad2(m[2])}-${pad2(m[1])}`;
@@ -375,7 +399,15 @@ function buildContext(reqBody = {}, authUser = null) {
   const invoices = compactInvoices(raw, { ...shell, interventions });
   const kmRoutes = compactKm(raw);
   if (authUser && currentUser) currentUser.role = currentUser.role || authUser.role || '';
-  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now: new Date(), authRole: authUser ? authUser.role : (currentUser && currentUser.role) || '' };
+  // v9.1 · SOLO nei test: il client può fissare l'orologio (context.now) così la
+  // suite HTTP non dipende dal giorno in cui viene eseguita. In produzione
+  // l'ora è sempre quella del server.
+  let now = new Date();
+  if (process.env.NODE_ENV === 'test' && raw.now) {
+    const t = new Date(raw.now);
+    if (!Number.isNaN(t.getTime())) now = t;
+  }
+  return { raw, users, currentUser, companies, services, interventions, invoices, kmRoutes, memory: recentMemory(raw), counts: raw.counts || {}, now, authRole: authUser ? authUser.role : (currentUser && currentUser.role) || '' };
 }
 
 function meaningfulTokens(s) {
@@ -460,7 +492,6 @@ function resolveServices(text, services) {
   if (!scored.length) return { matches: [], alternatives: [], ambiguous: false };
   const top = scored[0].score;
   const alternatives = scored.filter(x => x.score >= Math.max(15, top - 12)).slice(0, 10).map(x => x.item);
-  const matches = alternatives.filter((_, idx) => idx === 0 || alternatives.length <= 3 && top >= 70);
   const ambiguous = alternatives.length > 1 && top < 80 && (scored[1]?.score || 0) >= top - 10;
   return { matches: ambiguous ? [] : [scored[0].item], alternatives, ambiguous };
 }
@@ -499,7 +530,12 @@ function looksAction(text) {
   const n = norm(text);
   return /\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti|salva|elimina|cancella|rimuovi|togli|annulla|modifica|cambia|aggiorna|sposta|correggi|imposta|porta|crea cliente|nuovo cliente|aggiungi cliente|crea prestazione|nuova prestazione|emetti fattura|genera fattura|segna pagata|segna fatturato)\b/.test(n);
 }
-function isDeleteRequest(text) { return /\b(elimina|cancella|rimuovi|togli|annulla)\b/.test(norm(text)) && /\b(intervento|prestazione|cesareo|fecondazione|visita|ecografia|mastite|metrite|fattura)?/.test(norm(text)); }
+function isDeleteRequest(text) {
+  const n = norm(text);
+  // v9.1 · fix: il secondo pattern era opzionale ("?") e quindi sempre vero:
+  // qualunque "togli/annulla ..." veniva trattato come eliminazione intervento.
+  return /\b(elimina|cancella|rimuovi|togli|annulla)\b/.test(n) && /\b(intervento|interventi|prestazione|cesareo|cesario|fecondazione|inseminazione|visita|ecografia|vaccinazione|mastite|metrite|terapia|ultimo|quello di)\b/.test(n);
+}
 function isCreateClientRequest(text) { return /\b(crea|aggiungi|nuovo|inserisci)\b.*\b(cliente|azienda)\b/.test(norm(text)); }
 function isCreateInterventionRequest(text) { return /\b(ho fatto|ho eseguito|segna|registra|inserisci|aggiungi|metti)\b/.test(norm(text)) && /\b(cesareo|cesario|fecondazione|inseminazione|visita|ecografia|vaccinazione|mastite|metrite|terapia|dislocazione|abomaso|intervento)\b/.test(norm(text)); }
 function serviceTextFromRequest(text) {
@@ -1369,7 +1405,7 @@ function analyticsQuery(text, ctx) {
   }
 
   const monthlyRows = monthRowsForInterventions(ints);
-  const reply = `Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(giaFatturati)} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} (${invs.length}) · Imponibile: ${euro(imponibile)} · IVA: ${euro(iva)}.\nIncassato: ${euro(incassato)} · Da pagare: ${euro(aperte)}${scadute.length ? ' · Scadute: ' + euro(invoiceTotal(scadute)) : ''}.`;
+  const reply = `Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(giaFatturati)} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} (${invs.length}) · Imponibile: ${euro(imponibile)} · IVA: ${euro(iva)}.\nIncassato: ${euro(incassato)} · Da pagare: ${euro(aperte)}${scadute.length ? ' · Scadute: ' + euro(invoiceTotal(scadute)) : ''}.${forcedScopeLine(filters)}`;
   if (wantsChart(text) && monthlyRows.length) return chartResponse(reply, chartObject('line', `Andamento ricavi · ${scope}`, monthlyRows, { unit:'EUR', seriesName:'Ricavi' }), quick);
   return response(reply, null, quick);
 }
@@ -1653,11 +1689,21 @@ function serviceLookup(text, ctx) {
 }
 function managementFilters(text, ctx, defaultPeriod = 'ytd') {
   const period = parsePeriod(text, ctx.now, defaultPeriod);
-  const user = resolveUser(text, ctx.users, ctx.currentUser);
+  let user = resolveUser(text, ctx.users, ctx.currentUser);
   const cRes = resolveCompany(text, ctx.companies, { allowWeak: true });
   const company = cRes.match;
   const serviceText = extractServiceFilter(text, ctx);
-  return { period, user, company, companyResult: cRes, serviceText };
+  // v9.1 · scope coerente su TUTTE le letture (prima valeva solo per i KM):
+  // un worker che chiede i dati di un collega riceve i propri, con nota.
+  let forcedScope = false;
+  if (rvScope(ctx).type !== 'company' && user && String(user.id) !== String(ctx.currentUser?.id)) {
+    user = ctx.currentUser;
+    forcedScope = true;
+  }
+  return { period, user, company, companyResult: cRes, serviceText, forcedScope };
+}
+function forcedScopeLine(filters) {
+  return filters && filters.forcedScope ? '\n(Nota: il tuo account vede solo i propri dati, ho usato i tuoi.)' : '';
 }
 function interventionQuery(text, ctx) {
   const n = norm(text);
@@ -1674,7 +1720,7 @@ function interventionQuery(text, ctx) {
   const total = interventionTotal(items);
   const prestQty = items.reduce((s,i)=>s+(i.prestazioni||[]).reduce((q,p)=>q+num(p.qty,1),0),0);
   const quick = ['Grafico interventi','Ricavi periodo','Top prestazioni','Top clienti'];
-  if (countOnly) return response(`Interventi ${scope}: ${items.length}. Prestazioni: ${prestQty}. Totale: ${euro(total)}.`, null, quick);
+  if (countOnly) return response(`Interventi ${scope}: ${items.length}. Prestazioni: ${prestQty}. Totale: ${euro(total)}.${forcedScopeLine(filters)}`, null, quick);
   if (wantsChart(text) || /andamento|trend|per\s+(giorno|mese|prestaz|cliente|azienda)/.test(n)) {
     let rows;
     let title;
@@ -1687,7 +1733,7 @@ function interventionQuery(text, ctx) {
     return chartResponse(reply, chartObject(type, title, rows, { unit: rows[0]?.unit || 'interventi', seriesName: rows[0]?.unit === 'prestazioni' ? 'Prestazioni' : 'Interventi' }), ['Ricavi periodo','Top prestazioni','KPI periodo']);
   }
   const lines = items.slice(0, 18).map(i => `- ${formatIntervention(i)}`);
-  return response(`Interventi ${scope}: ${items.length}, prestazioni ${prestQty}, totale ${euro(total)}.\n${lines.join('\n')}${items.length > 18 ? `\n+ altri ${items.length - 18}` : ''}`, null, quick);
+  return response(`Interventi ${scope}: ${items.length}, prestazioni ${prestQty}, totale ${euro(total)}.${forcedScopeLine(filters)}\n${lines.join('\n')}${items.length > 18 ? `\n+ altri ${items.length - 18}` : ''}`, null, quick);
 }
 function revenueQuery(text, ctx) {
   const n = norm(text);
@@ -1714,7 +1760,7 @@ function revenueQuery(text, ctx) {
   const fattureEmesse = invoiceTotal(invs);
   const fatturePagate = invoiceTotal(invPaid);
   const fattureAperte = invoiceTotal(invUnpaid);
-  return { reply: `Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(giaFatturati)} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} · Incassato: ${euro(fatturePagate)} · Da pagare: ${euro(fattureAperte)}.`, action: null, actions: [], learn: [] };
+  return { reply: `Riepilogo economico ${scope}:\nRicavi interventi: ${euro(ricavi)} (${ints.length} interventi).\nGià fatturati: ${euro(giaFatturati)} · Da fatturare: ${euro(daFatturare)}.\nFatture emesse: ${euro(fattureEmesse)} · Incassato: ${euro(fatturePagate)} · Da pagare: ${euro(fattureAperte)}.${forcedScopeLine(filters)}`, action: null, actions: [], learn: [] };
 }
 function dashboardQuery(text, ctx) {
   if (!/\bdashboard\b|\bquadro\b|\briassunto\b/.test(norm(text))) return null;
@@ -2051,7 +2097,7 @@ function deleteInterventionRequest(text, ctx) {
   const items = filterInterventions(ctx, filters).sort((a,b) => String(b.data).localeCompare(String(a.data)) || String(b.ora).localeCompare(String(a.ora)));
   if (!items.length) return { reply: `Non trovo interventi da eliminare per ${displayScope(filters) || periodLabel(filters.period)}. Dimmi cliente, giorno e prestazione.`, action: null, actions: [], learn: [] };
   if (items.length === 1) return { reply: `Ho trovato questo intervento:\n- ${formatIntervention(items[0])}\nScrivi ELIMINA per cancellarlo.`, action: { type: 'delete_intervention', interventionId: items[0].id, query: text, note: 'Richiesta eliminazione da Rural Vet AI' }, actions: [], learn: [] };
-  return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi' }, actions: [], learn: [] };
+  return { reply: `Ho trovato più interventi possibili. Scegli il numero:\n` + items.slice(0, 12).map((i,idx)=>`${idx+1}) ${formatIntervention(i)}`).join('\n'), action: { type: 'delete_intervention', query: text, note: 'Scelta tra più interventi', options: items.slice(0, 12).map(i => ({ interventionId: i.id })) }, actions: [], learn: [] };
 }
 function deterministicRouter(text, ctx) {
   if (ctx.raw?.pendingServiceDraft) { const r = continueServiceDraft(text, ctx.raw.pendingServiceDraft, ctx); if (r) return r; }
@@ -2277,6 +2323,7 @@ const RV_AI_SECRET = (() => {
   return 'rv9-dev-secret-non-usare-in-produzione';
 })();
 const RV_AUTH_OPTIONAL = String(process.env.RV_AUTH_OPTIONAL || 'false').toLowerCase() === 'true';
+if (RV_AUTH_OPTIONAL) console.warn('[RV9] ATTENZIONE: RV_AUTH_OPTIONAL=true disattiva l\u2019obbligo di token. Usalo SOLO per debug, mai in produzione.');
 const RV_TOKEN_TTL_MS = Number(process.env.RV_TOKEN_TTL_MS || 12 * 60 * 60 * 1000);
 
 function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
@@ -2545,7 +2592,7 @@ function kmAnalyticsQuery(text, ctx) {
   let detail = '';
   if (wantDetail) detail = '\n\nTratte:\n' + st.rows.slice(0, 14).map(r => `- ${r.data} \u00b7 ${r.userName || '?'} \u00b7 ${r.company || '?'}: ${fmtKm(r.km)} km${r.isEstimate ? ' (stima)' : ''}`).join('\n') + (st.rows.length > 14 ? `\n\u2026 e altre ${st.rows.length - 14} tratte` : '');
 
-  const forcedLine = scoped.forced ? '\n(Nota: il tuo account vede solo i propri KM, ho usato i tuoi dati.)' : '';
+  const forcedLine = (scoped.forced || baseFilters.forcedScope) ? '\n(Nota: il tuo account vede solo i propri KM, ho usato i tuoi dati.)' : '';
   const reply = `KM percorsi \u00b7 ${who}\n${periodLbl}\n\n${body}${detail}${compareBlock}${estimateLine}${excludedLine}${forcedLine}`;
 
   const byUser = /per\s+(veterinario|collaboratore|utente)|\bconfronta\b.*\b(medardo|edoardo|team)\b|\bteam\b/.test(n) && scope.type === 'company';
@@ -2882,12 +2929,29 @@ function formatBeforeAfter(ba) {
 app.get('/', (req, res) => res.json({ ok: true, name: 'Rural Vet AI backend', version: VERSION, model: MODEL }));
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'rural-vet-ai', version: VERSION, model: MODEL, time: new Date().toISOString() }));
 
-/* RV9 · login: valida contro il registro server (base) o i collaboratori nel DB cloud. */
+/* RV9 · login: valida contro il registro server (base) o i collaboratori nel DB cloud.
+   v9.1 · protezione brute force: max 8 tentativi falliti per IP+utente ogni 10 minuti. */
+const RV_LOGIN_FAILS = new Map();
+function loginThrottleKey(req, userId) { return `${req.ip || req.socket?.remoteAddress || '?'}|${userId}`; }
+function loginThrottled(key) {
+  const rec = RV_LOGIN_FAILS.get(key);
+  if (!rec) return false;
+  if (Date.now() > rec.resetAt) { RV_LOGIN_FAILS.delete(key); return false; }
+  return rec.count >= 8;
+}
+function loginFail(key) {
+  const rec = RV_LOGIN_FAILS.get(key) || { count: 0, resetAt: Date.now() + 10 * 60 * 1000 };
+  rec.count += 1;
+  RV_LOGIN_FAILS.set(key, rec);
+  if (RV_LOGIN_FAILS.size > 5000) RV_LOGIN_FAILS.clear();
+}
 app.post('/api/auth/login', async (req, res) => {
   try {
     const userId = safeText(req.body?.userId, 80).toLowerCase().trim();
     const password = safeText(req.body?.password, 200);
     if (!userId || !password) return res.status(400).json({ ok: false, error: 'missing_credentials' });
+    const throttleKey = loginThrottleKey(req, userId);
+    if (loginThrottled(throttleKey)) return res.status(429).json({ ok: false, error: 'too_many_attempts', reply: 'Troppi tentativi falliti: riprova tra qualche minuto.' });
     let user = null;
     const base = rvRegistryUser(userId);
     if (base && sha256Hex(password) === base.passHash) user = base;
@@ -2901,7 +2965,8 @@ app.post('/api/auth/login', async (req, res) => {
         }
       } catch (e) { console.warn('[RV9] login: verifica collaboratori non riuscita:', e.message); }
     }
-    if (!user) return res.status(401).json({ ok: false, error: 'invalid_credentials', reply: 'Credenziali non valide.' });
+    if (!user) { loginFail(throttleKey); return res.status(401).json({ ok: false, error: 'invalid_credentials', reply: 'Credenziali non valide.' }); }
+    RV_LOGIN_FAILS.delete(throttleKey);
     return res.json({ ok: true, token: rvMakeToken(user), user: { id: user.id, name: user.name, role: user.role }, aiAccess: !!user.aiAccess, expiresInMs: RV_TOKEN_TTL_MS });
   } catch (err) {
     console.error('Errore /api/auth/login', err);
@@ -2969,7 +3034,7 @@ app.post('/api/debug-context', requireAi, (req, res) => {
   res.json({ ok: true, version: VERSION, counts: { users: ctx.users.length, companies: ctx.companies.length, services: ctx.services.length, interventions: ctx.interventions.length, invoices: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser, sampleCompanies: ctx.companies.slice(0, 5).map(c => c.nome), sampleServices: ctx.services.slice(0, 5).map(s => s.nome), sampleInterventions: ctx.interventions.slice(0, 3), sampleInvoices: ctx.invoices.slice(0, 3) });
 });
 
-app.post('/api/vet-ai-chat', requireAi, async (req, res) => {
+async function vetAiChatHandler(req, res) {
   try {
     const body = req.body || {};
     const text = safeText(body.input, MAX_INPUT_CHARS);
@@ -2977,19 +3042,19 @@ app.post('/api/vet-ai-chat', requireAi, async (req, res) => {
     if (!text.trim()) return res.json({ reply: 'Scrivimi cosa vuoi sapere o fare nel gestionale.', action: null, actions: [], learn: [], source: 'empty' });
 
     let result = deterministicRouter(text, ctx);
-    let source = 'deterministic-v8';
+    let source = 'deterministic-v9';
 
     if (!result && looksManagement(text)) {
       try {
         const plan = await planner(text, ctx);
         result = executePlan(plan, text, ctx);
-        source = 'planner-v8';
+        source = 'planner-v9';
       } catch (err) {
         console.warn('Planner non riuscito:', err.message);
       }
       if (!result) {
         result = { reply: 'Non sono riuscito a trovare quel dato nel gestionale con sicurezza. Dimmi cliente/prestazione/periodo in modo più preciso oppure aggiorna il gestionale e riprova.', action: null, actions: [], learn: [] };
-        source = 'safe-no-data-v8';
+        source = 'safe-no-data-v9';
       }
     }
 
@@ -3004,14 +3069,13 @@ app.post('/api/vet-ai-chat', requireAi, async (req, res) => {
     res.json({ ok: result.ok !== false, reply: safeText(result.reply || 'Dimmi meglio cosa vuoi fare.', 5000), data: result.data || null, action: result.action || null, actions: Array.isArray(result.actions) ? result.actions.slice(0, 12) : [], learn: Array.isArray(result.learn) ? result.learn.slice(0, 12) : [], quickReplies: Array.isArray(result.quickReplies) ? result.quickReplies.slice(0, 12) : [], ui: uiOut, chart: result.chart || result.ui?.chart || null, source, model: source.includes('openai') || source.includes('planner') ? MODEL : 'rural-vet-deterministic-v9', debug: { counts: { clienti: ctx.companies.length, prestazioni: ctx.services.length, interventi: ctx.interventions.length, fatture: ctx.invoices.length, km: ctx.kmRoutes.length }, currentUser: ctx.currentUser?.name || '' } });
   } catch (err) {
     console.error('Errore /api/vet-ai-chat', err);
-    res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v8' });
+    res.status(200).json({ ok: false, reply: 'Errore backend AI. Non rispondo a caso: controlla log Render e riprova.', action: null, actions: [], learn: [], error: err.message, source: 'error-v9' });
   }
-});
+}
 
-app.post(['/api/ai', '/api/chat'], (req, res, next) => {
-  req.url = '/api/vet-ai-chat';
-  app._router.handle(req, res, next);
-});
+// v9.1 · stessi handler registrati su tutti gli alias (prima si usava
+// l'API interna app._router, fragile tra versioni di Express).
+app.post(['/api/vet-ai-chat', '/api/ai', '/api/chat'], requireAi, vetAiChatHandler);
 
 if (process.env.NODE_ENV !== 'test') app.listen(PORT, () => console.log(`Rural Vet AI backend v${VERSION} attivo sulla porta ${PORT} con modello ${MODEL}`));
 

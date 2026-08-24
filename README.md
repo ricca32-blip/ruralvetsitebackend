@@ -1,4 +1,4 @@
-# Rural Vet — Gestionale + Rural Vet AI · v9.0.0
+# Rural Vet — Gestionale + Rural Vet AI · v9.1.0
 
 Gestionale veterinario buiatrico con assistente AI integrato, ripensato da zero
 nella parte AI: **autenticazione vera, motore KM deterministico, gestione
@@ -7,6 +7,55 @@ test comportamentali**.
 
 Il vincolo "incolla e vai" è mantenuto: **un solo `index.html`** (GitHub Pages)
 e **un solo `server.js`** (Render).
+
+---
+
+## Correzioni v9.1 (bugfix su v9)
+
+**Sicurezza e coerenza col design dichiarato.**
+- La **master key JSONBin è stata davvero rimossa dall'HTML**: la v9 la
+  dichiarava fuori dal client ma il "canale diretto" di fallback la teneva
+  ancora incorporata. Ora il sync cloud passa solo dal backend autenticato
+  (`/api/db/load` / `/api/db/save`); offline si lavora sulla copia locale del
+  browser. Dopo il deploy **ruota la vecchia chiave su jsonbin.io**.
+- **Login backend-first**: il controllo hash locale non è più un blocco che
+  precede il backend, quindi gli override password `RV_USER_<ID>_PASS` su
+  Render ora funzionano davvero; l'hash locale resta solo come fallback
+  offline (AI e cloud disattivati).
+- **Protezione brute force sul login** (max 8 tentativi falliti/10 minuti per
+  IP+utente) e warning nei log se `RV_AUTH_OPTIONAL=true`.
+- **Scope worker su tutte le letture**: prima valeva solo per i KM; ora anche
+  ricavi/interventi/analisi di un collega vengono riportati ai propri dati,
+  con nota esplicita nella risposta.
+
+**Bug numerici e di parsing (colpivano i dati mostrati).**
+- `num()`: **"12.4" veniva letto 124** (il punto era sempre trattato come
+  separatore delle migliaia). Corretto con euristica italiana: "1.234,56" →
+  1234,56; "12.4" → 12,4.
+- **Orari letti come date**: "alle 12.30" generava una finta data con
+  rollover silenzioso (finiva in un periodo del 2028). Giorno e mese ora sono
+  validati e gli orari introdotti da "alle/ore" vengono ignorati.
+- **Pagina Km allineata all'AI**: due interventi nella stessa azienda nello
+  stesso giro non contano più doppio nemmeno nella pagina Km (il fix v9 c'era
+  solo nel motore kmRoutes usato dalla chat: pagina e AI davano totali
+  diversi).
+- La pagina Km **salva in cloud solo se la cache km è cambiata** (prima ogni
+  apertura lanciava un salvataggio completo del DB).
+
+**Robustezza.**
+- La suite di test **non dipende più dal giorno di esecuzione**: i test HTTP
+  fissano l'orologio via `context.now`, onorato dal backend solo con
+  `NODE_ENV=test`. La suite passa 76/76 (72 originali + 4 regressioni nuove).
+- `isDeleteRequest` aveva un pattern sempre vero: qualunque "annulla/togli…"
+  partiva come eliminazione intervento. Ora serve un oggetto reale.
+- Preflight CORS coerente con `ALLOWED_ORIGIN`; alias `/api/ai` e `/api/chat`
+  registrati senza usare l'API interna di Express; l'eliminazione con più
+  interventi candidati include `options` come la modifica; un ping fallito al
+  backend (cold start Render) non blocca più la sessione in modalità locale.
+
+**Ordine di aggiornamento v9.1**: prima il backend, poi l'HTML. Con l'HTML
+v9.1 e il backend spento il gestionale funziona in locale ma senza sync cloud
+(per design: la chiave non è più nel client).
 
 ---
 
@@ -51,7 +100,7 @@ invece di sovrascrivere alla cieca.
 
 **4. Test veri.**
 `test-ai-flow.js` non controlla più che il sorgente "contenga certe stringhe":
-è una suite comportamentale con dataset realistico (72 test) che copre parser
+è una suite comportamentale con dataset realistico (76 test) che copre parser
 date, motore KM, listino, operazioni di riga, token e chiamate HTTP reali
 all'endpoint (incluso il 403 di Edoardo).
 
@@ -107,10 +156,24 @@ KM, `data` include periodo, totale, fonte, flag stima, esclusioni e confronto.
 
 ```bash
 npm install
-npm test        # esegue test-ai-flow.js: 72 test comportamentali
+npm test        # esegue test-ai-flow.js: 76 test comportamentali
 ```
 
 ## Note operative
+
+### Pulizia visite di prova (v9.1.1)
+In **Impostazioni** (profilo Rural Vet) c'è la card **"Pulizia visite di
+prova"** con un solo pulsante: **Elimina tutte le visite di prova**. Cancella
+in un colpo interventi, fatture, tratte km, diario AI e cestino listino.
+**Aziende, listino, collaboratori e impostazioni restano intatti** (le aziende
+sono dati reali e non vengono toccate). Prima della pulizia viene scaricato
+automaticamente un backup completo e la numerazione fatture riparte da 1.
+Le eliminazioni sono registrate in `db.deleted`: il merge multi-dispositivo
+non le fa risorgere da copie cloud o locali vecchie. È stata inoltre rimossa
+la semina automatica delle aziende iniziali a ogni caricamento (serviva solo
+al primissimo avvio e faceva ricomparire un'azienda anche dopo
+un'eliminazione volontaria): nessuna azienda esistente viene modificata.
+
 - Le voci di listino **archiviate** spariscono dai selettori dei nuovi
   interventi ma restano leggibili nello storico; si ripristinano anche via AI
   ("ripristina la prestazione X").

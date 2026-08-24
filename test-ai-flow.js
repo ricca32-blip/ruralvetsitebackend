@@ -65,7 +65,9 @@ const KMROUTES = [
 const FATTURE = [{ id: 900, numero: '12', data: '2026-07-14', allId: 3, tot: 61, pagata: false, interventi: [103] }];
 
 function makeBody({ user = USERS[0], km = KMROUTES, extras = {} } = {}) {
-  return { context: { user, users: USERS, aziende: AZIENDE, prestazioni: PREST, interventi: INT, fatture: FATTURE, km, ...extras } };
+  // v9.1 · now fisso: la suite HTTP non dipende più dal giorno in cui gira
+  // (context.now è onorato dal backend solo con NODE_ENV=test).
+  return { context: { now: NOW.toISOString(), user, users: USERS, aziende: AZIENDE, prestazioni: PREST, interventi: INT, fatture: FATTURE, km, ...extras } };
 }
 function ctxFor(userId = 'medardo', opts = {}) {
   const user = USERS.find(u => u.id === userId);
@@ -358,6 +360,28 @@ t('più interventi possibili → scelta numerata o target univoco, mai modifica 
 t('no-op sulle righe: "è già così"', () => {
   const r = updateInterventionRequest('porta le fecondazioni a 2 nell\'intervento di Rossi di oggi', ctxFor('medardo'));
   assert.ok(/gi\u00e0 cos\u00ec/i.test(r.reply));
+});
+
+console.log('\n== Regressioni v9.1 ==');
+const _bc = buildContext;
+t('num: "12.4" resta 12,4 (non 124) e "1.234,56" resta 1234,56', () => {
+  const ctx = _bc({ context: { now: NOW.toISOString(), km: [{ id: 'x1', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', km: '12.4', method: 'ors' }], user: USERS[0], users: USERS } }, { uid: 'medardo', name: 'Medardo Cammi', role: 'worker', ai: true, exp: Date.now() + 60000 });
+  assert.equal(ctx.kmRoutes[0].km, 12.4);
+  const ctx2 = _bc({ context: { now: NOW.toISOString(), km: [{ id: 'x2', data: '2026-07-15', userId: 'medardo', userName: 'Medardo Cammi', km: '1.234,56', method: 'ors' }], user: USERS[0], users: USERS } }, { uid: 'medardo', name: 'Medardo Cammi', role: 'worker', ai: true, exp: Date.now() + 60000 });
+  assert.equal(ctx2.kmRoutes[0].km, 1234.56);
+});
+t('date: "alle 12.30" non diventa una data', () => {
+  const p = parsePeriod('interventi di oggi alle 12.30', NOW, 'ytd');
+  assert.equal(p.from, '2026-07-15');
+  assert.equal(p.to, '2026-07-15');
+});
+t('scope worker sulle letture: "ricavi di edoardo" torna i propri con nota', () => {
+  const r = deterministicRouter('ricavi di edoardo da inizio anno', ctxFor('medardo'));
+  assert.ok(r && /solo i propri dati|Medardo/.test(r.reply));
+});
+t('delete: "annulla la nota" non parte come eliminazione intervento', () => {
+  const r = deterministicRouter('annulla la nota di prova', ctxFor('medardo'));
+  assert.ok(!r || !r.action || r.action.type !== 'delete_intervention');
 });
 
 console.log('\n== Autorizzazioni e token ==');
