@@ -2168,6 +2168,12 @@ function buildGeneralPrompt() {
   return `Sei Rural Vet AI, assistente operativo interno del gestionale veterinario Rural Vet.
 Non sei una chat generica e non devi divagare: il tuo valore è far lavorare più velocemente il veterinario dentro il gestionale.
 
+AMBITO OBBLIGATORIO (v9.2)
+Rispondi SOLO su due argomenti:
+1) gestione degli interventi del gestionale: aggiungere, modificare, eliminare;
+2) numeri della dashboard: km percorsi (es. km di Medardo), ricavi per periodo (es. ricavi di Rural Vet nel mese X), interventi, prestazioni, fatture, clienti, confronti e trend.
+Qualsiasi altra richiesta (consulenza clinica generica, ricette, farmacologia, meteo, cultura generale, chiacchiere) va rifiutata con UNA frase breve e cortese, riportando l'utente su interventi o numeri del gestionale. Non proporre quickReplies promozionali o suggerimenti non richiesti: usa quickReplies solo quando servono per completare un'azione in corso (scelta, conferma SALVA/ELIMINA, periodo).
+
 MISSIONE PRIORITARIA
 Devi essere eccellente e prevedibile in due aree:
 1) lettura dei dati gestionali con KPI, riepiloghi, grafici e indicatori;
@@ -2336,7 +2342,9 @@ function unb64u(s) { try { return JSON.parse(Buffer.from(String(s), 'base64url')
 const RV_BASE_USERS = [
   { id: 'ruralvet', name: 'Rural Vet', role: 'company', passHash: '158a323a7ba44870f23d96f1516dd70aa48e9a72db4ebb026b0a89e212a208ab', aiAccess: true },
   { id: 'medardo', name: 'Medardo Cammi', role: 'worker', passHash: '3d1e557b540ac045b3b327994a351f08a443f9216f9b2b8d3a0f42b58671ac83', aiAccess: true },
-  { id: 'edoardo', name: 'Edoardo Ronda', role: 'worker', passHash: '9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0', aiAccess: false }
+  { id: 'edoardo', name: 'Edoardo Ronda', role: 'worker', passHash: '9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0', aiAccess: false },
+  // v9.2 · Giulia Dada: Team Member sulla falsariga di Edoardo (password '0000', override con RV_USER_GIULIA_PASS)
+  { id: 'giulia', name: 'Giulia Dada', role: 'worker', passHash: '9af15b336e6a9619928537df30b2e6a2376569fcf9d7e773eccede65606529a0', aiAccess: false }
 ];
 function rvRegistryUser(id) {
   const base = RV_BASE_USERS.find(u => u.id === String(id || '').toLowerCase());
